@@ -2,10 +2,11 @@
 # Agent Mail 맥 앱(.app)과 설치용 디스크 이미지(.dmg)를 만든다.
 #
 #   packaging/package-macos.sh                 # 서명까지
-#   NOTARY_PROFILE=이름 packaging/package-macos.sh   # 서명 + Apple 공증 + 스테이플
+#   NOTARY_PROFILE=ugot-live packaging/package-macos.sh   # 서명 + Apple 공증 + 스테이플
 #
-# 공증 프로필은 한 번만 직접 만들어 두면 된다:
-#   xcrun notarytool store-credentials 이름 --apple-id <애플ID> --team-id HBNVC7KCMH
+# 공증 프로필은 팀(HBNVC7KCMH) 단위라 다른 앱과 같이 쓴다. 이 맥에는 `ugot-live`가 저장돼 있다
+# (v0.2.0 공증에 사용, Antigravity 대화 97f8437a에서 처음 만듦). 새 맥이면 한 번만 직접 만든다:
+#   xcrun notarytool store-credentials ugot-live --apple-id <애플ID> --team-id HBNVC7KCMH
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
