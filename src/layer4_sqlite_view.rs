@@ -83,15 +83,24 @@ impl SqliteProjection {
                 hint,
                 body_md
             );
+
+            -- 파일 리스 영속화: 데몬 재시작 후에도 이 노드가 알던 리스 테이블을 그대로 복원한다.
+            CREATE TABLE IF NOT EXISTS leases (
+                glob_pattern TEXT PRIMARY KEY,
+                expires_wall_ms INTEGER NOT NULL,
+                claim_json TEXT NOT NULL
+            );
             ",
         )?;
+
+        let arbiter = Self::load_leases(&conn)?;
 
         let (event_tx, _) = broadcast::channel(256);
         Ok(Self {
             inner: Mutex::new(InnerState {
                 conn,
                 staging_headers: HashMap::new(),
-                arbiter: DeterministicLeaseArbiter::default(),
+                arbiter,
                 crdt: TeamCrdtDoc::new(peer_id_u64),
             }),
             wake_notify: Notify::new(),
@@ -227,10 +236,53 @@ impl SqliteProjection {
         Ok(deleted)
     }
 
+    /// 디스크의 리스 테이블을 읽어 중재기를 다시 만든다. 만료된 행은 버리고 지운다.
+    /// 복원도 `apply_claim`을 거치므로 겹치는 행이 있으면 실행 중과 같은 규칙으로 승자가 정해진다.
+    fn load_leases(conn: &Connection) -> Result<DeterministicLeaseArbiter> {
+        let now = now_unix_ms();
+        conn.execute("DELETE FROM leases WHERE expires_wall_ms <= ?1", params![now as i64])?;
+        let mut arbiter = DeterministicLeaseArbiter::default();
+        let mut stmt = conn.prepare("SELECT claim_json FROM leases ORDER BY glob_pattern")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            match serde_json::from_str::<LeaseClaim>(&row?) {
+                Ok(claim) => {
+                    let _ = arbiter.apply_claim(claim, now);
+                }
+                Err(e) => tracing::warn!("Skipping unreadable persisted lease row: {e}"),
+            }
+        }
+        Ok(arbiter)
+    }
+
+    /// 중재기의 현재 리스 집합을 한 트랜잭션으로 디스크에 반영한다(리스는 많아야 수십 개).
+    fn persist_leases(state: &mut InnerState) {
+        let leases = state.arbiter.snapshot(now_unix_ms());
+        let result = (|| -> rusqlite::Result<()> {
+            let tx = state.conn.transaction()?;
+            tx.execute("DELETE FROM leases", [])?;
+            for c in &leases {
+                let json = serde_json::to_string(c).unwrap_or_default();
+                tx.execute(
+                    "INSERT INTO leases (glob_pattern, expires_wall_ms, claim_json) VALUES (?1, ?2, ?3)",
+                    params![c.glob_pattern, c.expires_wall_ms as i64, json],
+                )?;
+            }
+            tx.commit()
+        })();
+        if let Err(e) = result {
+            tracing::warn!("Failed to persist lease table: {e}");
+        }
+    }
+
     pub fn apply_lease_claim(&self, claim: LeaseClaim) -> std::result::Result<(), LeaseClaim> {
         let res = {
             let mut guard = self.inner.lock().unwrap();
-            guard.arbiter.apply_claim(claim, now_unix_ms())
+            let res = guard.arbiter.apply_claim(claim, now_unix_ms());
+            if res.is_ok() {
+                Self::persist_leases(&mut guard);
+            }
+            res
         };
         self.wake_notify.notify_waiters();
         res
@@ -239,7 +291,11 @@ impl SqliteProjection {
     pub fn release_lease(&self, holder: &str, glob_pattern: &str) -> bool {
         let ok = {
             let mut guard = self.inner.lock().unwrap();
-            guard.arbiter.release(holder, glob_pattern)
+            let ok = guard.arbiter.release(holder, glob_pattern);
+            if ok {
+                Self::persist_leases(&mut guard);
+            }
+            ok
         };
         if ok {
             self.wake_notify.notify_waiters();
@@ -546,5 +602,101 @@ impl SqliteProjection {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_persistence_tests {
+    use super::*;
+    use crate::layer3_state_auth::HlcTimestamp;
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "amp2p-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            now_unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("mail.sqlite3")
+    }
+
+    fn claim(pattern: &str, agent: &str, expires_wall_ms: u64) -> LeaseClaim {
+        LeaseClaim {
+            glob_pattern: pattern.to_string(),
+            holder_agent: agent.to_string(),
+            holder_pk: [7u8; 32],
+            acquired_hlc: HlcTimestamp { wall_ms: now_unix_ms(), logical: 0, node_tag: [7u8; 8] },
+            expires_wall_ms,
+            reason: String::new(),
+            overseer_override: false,
+        }
+    }
+
+    fn patterns(store: &SqliteProjection) -> Vec<String> {
+        let mut guard = store.inner.lock().unwrap();
+        let mut v: Vec<String> = guard
+            .arbiter
+            .snapshot(now_unix_ms())
+            .into_iter()
+            .map(|c| c.glob_pattern)
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn lease_survives_restart() {
+        let db = temp_db("survive");
+        {
+            let store = SqliteProjection::open(&db, 1).unwrap();
+            store.apply_lease_claim(claim("src/api/*", "be", now_unix_ms() + 60_000)).unwrap();
+        }
+        let store = SqliteProjection::open(&db, 1).unwrap();
+        assert_eq!(patterns(&store), vec!["src/api/*".to_string()]);
+        // 재시작 후에도 다른 에이전트의 편집은 충돌로 잡혀야 한다
+        assert!(store.check_path_conflict("fe", "src/api/user.rs").is_some());
+    }
+
+    #[test]
+    fn released_lease_stays_released_after_restart() {
+        let db = temp_db("release");
+        {
+            let store = SqliteProjection::open(&db, 1).unwrap();
+            store.apply_lease_claim(claim("src/api/*", "be", now_unix_ms() + 60_000)).unwrap();
+            assert!(store.release_lease("be", "src/api/*"));
+        }
+        let store = SqliteProjection::open(&db, 1).unwrap();
+        assert!(patterns(&store).is_empty());
+    }
+
+    #[test]
+    fn expired_lease_is_not_restored() {
+        let db = temp_db("expired");
+        {
+            let store = SqliteProjection::open(&db, 1).unwrap();
+            store.apply_lease_claim(claim("src/ui/*", "fe", now_unix_ms() + 150)).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let store = SqliteProjection::open(&db, 1).unwrap();
+        assert!(patterns(&store).is_empty());
+    }
+
+    #[test]
+    fn losing_lease_is_removed_from_disk_too() {
+        let db = temp_db("loser");
+        {
+            let store = SqliteProjection::open(&db, 1).unwrap();
+            let mut late = claim("src/db/*", "db", now_unix_ms() + 60_000);
+            late.acquired_hlc.wall_ms += 1_000;
+            store.apply_lease_claim(late).unwrap();
+            let mut early = claim("src/db/*", "be", now_unix_ms() + 60_000);
+            early.acquired_hlc.wall_ms -= 1_000;
+            store.apply_lease_claim(early).unwrap(); // 더 이른 HLC가 이긴다
+        }
+        let store = SqliteProjection::open(&db, 1).unwrap();
+        let mut guard = store.inner.lock().unwrap();
+        let holders: Vec<String> = guard.arbiter.snapshot(now_unix_ms()).into_iter().map(|c| c.holder_agent).collect();
+        assert_eq!(holders, vec!["be".to_string()]);
     }
 }
