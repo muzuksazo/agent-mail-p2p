@@ -6,6 +6,7 @@
   2. 합류 전에 pm이 건 리스가 be에 복구되는가
   3. 합류 전에 pm이 올린 팀원 정보(Loro)가 be에 보이는가
   4. 합류 후 메시지가 양방향으로 전파되는가
+  5. 메시지가 하나도 없는 방에 합류한 팀원(qa)도 방장을 보게 되는가
 
 사용법: python3 scripts/smoke2.py [실행 파일 경로]  (기본: target/release/agent-mail-p2p)
 임시 폴더와 18775/18776 포트를 쓰며, 끝나면 자기가 띄운 프로세스만 종료한다.
@@ -23,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 BIN = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent.parent / "target/release/agent-mail-p2p")
-PM_PORT, BE_PORT = 18775, 18776
+PM_PORT, BE_PORT, QA_PORT = 18775, 18776, 18777
 WAIT_S = int(os.environ.get("SMOKE_WAIT_S", "45"))
 
 
@@ -68,7 +69,7 @@ def mcp_calls(agent: str, port: int, calls: list[tuple[str, dict]]) -> None:
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="amp2p-smoke-"))
     procs: list[subprocess.Popen] = []
-    logs = {"pm": tmp / "pm.log", "be": tmp / "be.log"}
+    logs = {"pm": tmp / "pm.log", "be": tmp / "be.log", "qa": tmp / "qa.log"}
     results: list[tuple[str, bool, str]] = []
     try:
         pm = subprocess.Popen([BIN, "open", "--agent", "pm", "--name", "PM", "--port", str(PM_PORT), "--data-dir", str(tmp / "pm")],
@@ -84,6 +85,13 @@ def main() -> int:
             time.sleep(0.2)
         if not ticket:
             raise RuntimeError("no ticket printed")
+
+        # 메시지가 하나도 없는 빈 방에 먼저 합류(범위 비교로는 차이가 안 보이는 경우)
+        qa = subprocess.Popen([BIN, "join", ticket, "--agent", "qa", "--name", "QA", "--port", str(QA_PORT), "--data-dir", str(tmp / "qa")],
+                              stdout=subprocess.DEVNULL, stderr=open(logs["qa"], "w"))
+        procs.append(qa)
+        wait_http(QA_PORT)
+        time.sleep(2)
 
         mcp_calls("pm", PM_PORT, [
             ("send_mail", {"recipient": "all", "body_md": "합류 전 메시지", "priority": "normal"}),
@@ -109,6 +117,11 @@ def main() -> int:
         results.append(("합류 전 메시지 복구", any(m.get("body_md") == "합류 전 메시지" for m in b["messages"]), took))
         results.append(("합류 전 리스 복구", any(l["glob_pattern"] == "docs/*" for l in b["leases"]), took))
         results.append(("합류 전 팀원 정보 복구", any(a["id"] == "pm" for a in b["agents"]), took))
+
+        start = time.time()
+        while time.time() - start < WAIT_S and not any(a["id"] == "pm" for a in state(QA_PORT)["agents"]):
+            time.sleep(1)
+        results.append(("빈 방 합류자가 방장 보기", any(a["id"] == "pm" for a in state(QA_PORT)["agents"]), f"{time.time() - start:.0f}초"))
 
         mcp_calls("pm", PM_PORT, [("send_mail", {"recipient": "be", "body_md": "합류 후 pm→be", "priority": "normal"})])
         mcp_calls("be", BE_PORT, [("send_mail", {"recipient": "pm", "body_md": "합류 후 be→pm", "priority": "normal"})])

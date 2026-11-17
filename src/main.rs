@@ -9,6 +9,7 @@
 //!   3) Claude Code / Codex / Cursor 로컬 MCP 브리지 연결:
 //!      `agent-mail-p2p mcp --agent be --daemon-url http://127.0.0.1:18766`
 
+mod app_mode;
 mod layer1_transport;
 mod layer2_reconcile;
 mod layer3_state_auth;
@@ -40,8 +41,9 @@ use crate::layer5_mcp_bridge::{
 #[derive(Parser)]
 #[command(name = "agent-mail-p2p", version, about = "5-Layer Serverless P2P Agent Mail & MCP Bus")]
 struct Cli {
+    /// 하위 명령 없이 실행하면(= 앱 더블클릭) 앱 모드로 동작한다.
     #[command(subcommand)]
-    cmd: Command,
+    cmd: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -80,6 +82,8 @@ enum Command {
         #[arg(long)]
         no_channel_push: bool,
     },
+    /// 앱 모드(시작 화면 → 방 만들기/초대 코드 → 단톡방). 인자 없이 실행한 것과 같다.
+    App,
     /// PostToolUse / PreToolUse 라이프사이클 훅 실행
     Hook {
         mode: String,
@@ -97,9 +101,17 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
+    // 예전 macOS가 Finder 실행 시 붙이는 -psn_ 인자는 무시한다.
+    let args: Vec<String> = std::env::args().filter(|a| !a.starts_with("-psn_")).collect();
+    let cli = Cli::parse_from(args);
 
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        return app_mode::run().await;
+    };
+
+    match cmd {
+        Command::App => app_mode::run().await,
+
         Command::Mcp {
             agent,
             daemon_url,
@@ -146,33 +158,8 @@ async fn main() -> Result<()> {
             port,
             data_dir,
         } => {
-            let iroh_sk = load_or_create_secret_key(&data_dir.join(format!("{agent}.key")))?;
-            let signing_key = SigningKey::from_bytes(&iroh_sk.to_bytes());
-            let root_pk = signing_key.verifying_key().to_bytes();
-            let cert = CapabilityCert::issue(
-                &signing_key,
-                root_pk,
-                RoleScope::Overseer,
-                30 * 24 * 3600 * 1000,
-            )?;
-
-            let topic_bytes: [u8; 32] = rand::random();
-            let topic = TopicId::from_bytes(topic_bytes);
-
-            run_p2p_daemon(
-                agent,
-                name,
-                true,
-                iroh_sk,
-                signing_key,
-                root_pk,
-                cert,
-                topic,
-                Vec::new(),
-                port,
-                data_dir,
-            )
-            .await
+            let topic: [u8; 32] = rand::random();
+            start_host(agent, name, topic, port, data_dir, app_mode::AppInfo::default()).await
         }
 
         Command::Join {
@@ -183,38 +170,79 @@ async fn main() -> Result<()> {
             port,
             data_dir,
         } => {
-            let parsed = SwarmTicket::from_str(&ticket)?;
-            let iroh_sk = load_or_create_secret_key(&data_dir.join(format!("{agent}.key")))?;
-            let signing_key = SigningKey::from_bytes(&iroh_sk.to_bytes());
-            let my_pk = signing_key.verifying_key().to_bytes();
-
-            // 데모 편의상 자체 서명 에이전트 인증서 발급 (프로덕션에서는 팀장이 서명한 위임 토큰 문자열을 전달)
-            let cert = CapabilityCert::issue(
-                &signing_key,
-                my_pk,
-                RoleScope::Agent {
-                    agent_id: agent.clone(),
-                    allowed_glob_prefix: allowed_glob,
-                },
-                7 * 24 * 3600 * 1000,
-            )?;
-
-            run_p2p_daemon(
-                agent,
-                name,
-                false,
-                iroh_sk,
-                signing_key,
-                parsed.overseer_root_pk,
-                cert,
-                parsed.topic,
-                parsed.bootstrap,
-                port,
-                data_dir,
-            )
-            .await
+            start_member(ticket, agent, name, allowed_glob, port, data_dir, app_mode::AppInfo::default()).await
         }
     }
+}
+
+/// 방을 만든 사람(팀장, Overseer)으로 노드를 띄운다. CLI `open`과 앱 모드가 같이 쓴다.
+pub(crate) async fn start_host(
+    agent: String,
+    name: String,
+    topic_bytes: [u8; 32],
+    port: u16,
+    data_dir: PathBuf,
+    mut app: app_mode::AppInfo,
+) -> Result<()> {
+    let iroh_sk = load_or_create_secret_key(&data_dir.join(format!("{agent}.key")))?;
+    let signing_key = SigningKey::from_bytes(&iroh_sk.to_bytes());
+    let root_pk = signing_key.verifying_key().to_bytes();
+    let cert = CapabilityCert::issue(&signing_key, root_pk, RoleScope::Overseer, 30 * 24 * 3600 * 1000)?;
+    let topic = TopicId::from_bytes(topic_bytes);
+    if app.role.is_empty() {
+        app.role = "host".into();
+        app.name = name.clone();
+        app.port = port;
+    }
+    run_p2p_daemon(agent, name, true, iroh_sk, signing_key, root_pk, cert, topic, Vec::new(), port, data_dir, app).await
+}
+
+/// 초대 코드로 들어온 팀원으로 노드를 띄운다. CLI `join`과 앱 모드가 같이 쓴다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_member(
+    ticket: String,
+    agent: String,
+    name: String,
+    allowed_glob: String,
+    port: u16,
+    data_dir: PathBuf,
+    mut app: app_mode::AppInfo,
+) -> Result<()> {
+    let parsed = SwarmTicket::from_str(&ticket)?;
+    let iroh_sk = load_or_create_secret_key(&data_dir.join(format!("{agent}.key")))?;
+    let signing_key = SigningKey::from_bytes(&iroh_sk.to_bytes());
+    let my_pk = signing_key.verifying_key().to_bytes();
+
+    // 데모 편의상 자체 서명 에이전트 인증서 발급 (프로덕션에서는 팀장이 서명한 위임 토큰 문자열을 전달)
+    let cert = CapabilityCert::issue(
+        &signing_key,
+        my_pk,
+        RoleScope::Agent {
+            agent_id: agent.clone(),
+            allowed_glob_prefix: allowed_glob,
+        },
+        7 * 24 * 3600 * 1000,
+    )?;
+    if app.role.is_empty() {
+        app.role = "member".into();
+        app.name = name.clone();
+        app.port = port;
+    }
+    run_p2p_daemon(
+        agent,
+        name,
+        false,
+        iroh_sk,
+        signing_key,
+        parsed.overseer_root_pk,
+        cert,
+        parsed.topic,
+        parsed.bootstrap,
+        port,
+        data_dir,
+        app,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -230,6 +258,7 @@ async fn run_p2p_daemon(
     bootstrap_addrs: Vec<iroh::EndpointAddr>,
     port: u16,
     data_dir: PathBuf,
+    mut app: app_mode::AppInfo,
 ) -> Result<()> {
     let my_pk = signing_key.verifying_key().to_bytes();
     let peer_u64 = u64::from_le_bytes(my_pk[..8].try_into().unwrap());
@@ -259,7 +288,19 @@ async fn run_p2p_daemon(
     };
     eprintln!("===============================================================");
     eprintln!("[P2P Node Active] EndpointId : {}", node.endpoint_id());
-    eprintln!("[Swarm Join Ticket]          : {}", ticket.encode()?);
+    let ticket_str = ticket.encode()?;
+    eprintln!("[Swarm Join Ticket]          : {ticket_str}");
+    // 앱 화면의 [친구 초대] 버튼이 건네는 코드: 방을 만든 사람은 자기 티켓, 초대받은 사람은 받은 티켓을 그대로 전달한다.
+    app.ticket = if is_overseer || bootstrap_addrs.is_empty() {
+        ticket_str.clone()
+    } else {
+        SwarmTicket {
+            topic,
+            overseer_root_pk,
+            bootstrap: bootstrap_addrs.clone(),
+        }
+        .encode()?
+    };
     eprintln!("[Local Group-Chat & MCP API] : http://127.0.0.1:{port}");
     eprintln!("===============================================================");
 
@@ -305,6 +346,7 @@ async fn run_p2p_daemon(
     let store_beacon = store.clone();
     let beacon_tx = gossip_out_tx.clone();
     let beacon_agent = agent_id.clone();
+    let mut beacon_clock = HybridClock::new(&my_pk);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(15)).await;
@@ -312,6 +354,16 @@ async fn run_p2p_daemon(
             // 늦게 합류했거나 재시작한 팀원도 다음 주기 안에 같은 리스 테이블로 수렴한다(같은 클레임은 멱등).
             for claim in store_beacon.leases_held_by(&beacon_agent) {
                 let _ = beacon_tx.send(GossipKind::LeaseAnnounced(claim)).await;
+            }
+            // 팀 보드(누가 방에 있는지)도 범위 비교 대상이 아니라서, 메시지가 하나도 없으면
+            // 늦게 들어온 팀원이 먼저 있던 사람을 영영 못 본다. 스냅샷을 다시 알려 수렴시킨다(CRDT 병합은 멱등).
+            if let Ok(snapshot) = store_beacon.export_loro_snapshot() {
+                let _ = beacon_tx
+                    .send(GossipKind::LoroDelta {
+                        delta_bytes: snapshot,
+                        hlc: beacon_clock.tick(),
+                    })
+                    .await;
             }
             let range = TimeRange {
                 start_ms: 0,
@@ -447,6 +499,7 @@ async fn run_p2p_daemon(
         store,
         clock: std::sync::Mutex::new(HybridClock::new(&my_pk)),
         gossip_out_tx,
+        app,
     });
 
     let app = build_local_http_router(bridge_state);

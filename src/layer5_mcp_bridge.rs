@@ -37,6 +37,7 @@ pub struct LocalBridgeState {
     pub store: Arc<SqliteProjection>,
     pub clock: std::sync::Mutex<HybridClock>,
     pub gossip_out_tx: mpsc::Sender<GossipKind>,
+    pub app: crate::app_mode::AppInfo,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +81,10 @@ pub fn build_local_http_router(state: Arc<LocalBridgeState>) -> AxumRouter {
         .route("/api/events", get(api_sse_events))
         .route("/api/send", post(api_send))
         .route("/api/leases/reserve", post(api_lease_reserve))
+        .route("/api/app/info", get(crate::app_mode::api_app_info))
+        .route("/api/app/claude", post(crate::app_mode::api_connect_claude))
+        .route("/api/app/quit", post(crate::app_mode::api_quit))
+        .route("/api/app/leave", post(crate::app_mode::api_leave))
         .with_state(state)
 }
 

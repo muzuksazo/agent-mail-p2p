@@ -2,6 +2,19 @@
 
 클라우드 서버나 외부 DB 가입 없이 5대의 팀원 PC가 **Iroh QUIC 홀펀칭 + Plumtree 가십 + 범위 지문 부분 동기화 + Loro CRDT + HLC 결정론적 파일 리스 + 로컬 SQLite WAL/FTS5**로 직결되는 단일 바이너리 Rust 프로젝트입니다.
 
+
+## 맥 앱으로 쓰기 (가장 쉬움)
+
+1. [Releases](https://github.com/muzuksazo/agent-mail-p2p/releases)에서 `AgentMail-x.y.z.dmg`를 받아 열고, **Agent Mail**을 **응용 프로그램** 폴더로 끌어다 놓아요.
+2. **Agent Mail**을 더블클릭하면 브라우저에 화면이 열려요.
+3. 이름을 적고 **방 만들기** → 🎟️ **친구 초대**에서 **초대 코드 복사** → 친구에게 보내요.
+   친구는 앱을 열고 **초대받은 방 들어가기**에 붙여 넣으면 끝이에요.
+
+다음부터는 앱을 열면 같은 방으로 바로 들어가요. Claude Code 연결은 화면의 🤖 **Claude 연결** 버튼 하나로 돼요.
+끄기·다른 방으로 옮기기는 화면 오른쪽 위 `⋯`에 있어요.
+
+아래는 터미널에서 직접 쓰는 방법(개발자용)이에요.
+
 ## 빌드 방법 (Windows / Linux / WSL 공통)
 `rusqlite`가 `bundled` 모드로 포함되어 있어 시스템에 SQLite가 없어도 한 줄로 단일 실행 파일이 생성됩니다.
 ```bash

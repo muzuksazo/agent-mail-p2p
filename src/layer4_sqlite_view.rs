@@ -319,6 +319,12 @@ impl SqliteProjection {
         guard.arbiter.check_path(agent_id, path, now_unix_ms())
     }
 
+    /// 팀 보드(Loro) 전체 스냅샷. 주기적으로 다시 알려 늦게 들어온 팀원도 같은 보드로 수렴하게 한다.
+    pub fn export_loro_snapshot(&self) -> Result<Vec<u8>> {
+        let guard = self.inner.lock().unwrap();
+        guard.crdt.export_snapshot()
+    }
+
     pub fn merge_loro_delta(&self, delta: &[u8]) -> Result<()> {
         {
             let guard = self.inner.lock().unwrap();
@@ -452,8 +458,11 @@ impl SqliteProjection {
 
         let mut msgs = Vec::new();
         if let Ok(mut stmt) = guard.conn.prepare(
-            "SELECT id, sender, recipient, priority, hint, body_md, status, ack_note, hlc_wall_ms
-             FROM messages ORDER BY hlc_wall_ms ASC LIMIT 80",
+            // 가장 최근 80개를 시간순으로 (예전에는 가장 오래된 80개만 보여 새 메시지가 화면에서 사라졌다)
+            "SELECT * FROM (
+               SELECT id, sender, recipient, priority, hint, body_md, status, ack_note, hlc_wall_ms, hlc_logical
+               FROM messages ORDER BY hlc_wall_ms DESC, hlc_logical DESC LIMIT 80
+             ) ORDER BY hlc_wall_ms ASC, hlc_logical ASC",
         ) {
             if let Ok(iter) = stmt.query_map([], |r| {
                 Ok(serde_json::json!({
