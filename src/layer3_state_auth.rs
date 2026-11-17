@@ -292,16 +292,31 @@ impl TeamCrdtDoc {
     ) -> Result<Vec<u8>> {
         let vv_before = self.doc.oplog_vv();
         let agents_map = self.doc.get_map("agents");
-        let entry = serde_json::json!({
+        // 에이전트가 스스로 정한 '하는 일'과 '대화 상대'는 재시작해도 유지한다.
+        let previous = self.agent_entry(agent_id);
+        let kept_task = previous.as_ref().and_then(|p| p.get("task_set_by_agent").and_then(|v| v.as_bool())).unwrap_or(false);
+        let task_value = if kept_task {
+            previous.as_ref().and_then(|p| p.get("task").cloned()).unwrap_or_else(|| serde_json::json!(task))
+        } else {
+            serde_json::json!(task)
+        };
+        let mut entry = serde_json::json!({
             "id": agent_id,
             "name": name,
             "role": role,
             "engine": engine,
-            "task": task,
+            "task": task_value,
             "progress": progress,
             "status": status,
             "pk": pk_hex,
         });
+        if let Some(prev) = &previous {
+            for key in ["target", "task_set_by_agent", "status_at_ms"] {
+                if let Some(v) = prev.get(key) {
+                    entry[key] = v.clone();
+                }
+            }
+        }
         agents_map.insert(agent_id, entry.to_string())?;
         self.doc.commit();
         Ok(self.doc.export(ExportMode::updates(&vv_before))?)
@@ -314,6 +329,33 @@ impl TeamCrdtDoc {
 
     pub fn export_snapshot(&self) -> Result<Vec<u8>> {
         Ok(self.doc.export(ExportMode::Snapshot)?)
+    }
+
+    fn agent_entry(&self, agent_id: &str) -> Option<serde_json::Value> {
+        let val = self.doc.get_map("agents").get_deep_value();
+        if let LoroValue::Map(m) = val {
+            if let Some(LoroValue::String(s)) = m.get(agent_id) {
+                return serde_json::from_str(s).ok();
+            }
+        }
+        None
+    }
+
+    /// 에이전트가 정한 '하는 일(task)'과 '대화 상대(target)'를 명부의 내 항목에 반영하고 변경분을 돌려준다.
+    pub fn set_agent_fields(&self, agent_id: &str, task: Option<&str>, target: Option<&str>, now_ms: u64) -> Result<Vec<u8>> {
+        let vv_before = self.doc.oplog_vv();
+        let mut entry = self.agent_entry(agent_id).unwrap_or_else(|| serde_json::json!({ "id": agent_id, "name": agent_id }));
+        if let Some(t) = task {
+            entry["task"] = serde_json::json!(t);
+            entry["task_set_by_agent"] = serde_json::json!(true);
+        }
+        if let Some(t) = target {
+            entry["target"] = serde_json::json!(t);
+        }
+        entry["status_at_ms"] = serde_json::json!(now_ms);
+        self.doc.get_map("agents").insert(agent_id, entry.to_string())?;
+        self.doc.commit();
+        Ok(self.doc.export(ExportMode::updates(&vv_before))?)
     }
 
     pub fn list_agents_json(&self) -> Vec<serde_json::Value> {

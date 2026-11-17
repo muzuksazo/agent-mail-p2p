@@ -378,6 +378,18 @@ impl SqliteProjection {
         Ok(())
     }
 
+    /// 에이전트가 MCP로 정한 '하는 일'·'대화 상대'를 명부에 반영(변경분은 호출한 쪽이 가십으로 퍼뜨린다).
+    pub fn update_local_fields(&self, agent_id: &str, task: Option<&str>, target: Option<&str>) -> Result<Vec<u8>> {
+        let delta = {
+            let guard = self.inner.lock().unwrap();
+            let d = guard.crdt.set_agent_fields(agent_id, task, target, now_unix_ms())?;
+            Self::save_roster(&guard);
+            d
+        };
+        self.wake_notify.notify_waiters();
+        Ok(delta)
+    }
+
     /// 서명 키가 pk인 팀원에게서 신호를 받았다(가십 봉투 검증 직후 호출).
     pub fn touch_presence(&self, pk: &[u8; 32], now_ms: u64) {
         let guard = self.inner.lock().unwrap();
@@ -398,13 +410,13 @@ impl SqliteProjection {
         let guard = self.inner.lock().unwrap();
         let sql = if fresh_only {
             "SELECT id, sender, recipient, priority, hint, hlc_wall_ms FROM messages m
-             WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')
+             WHERE (recipient = 'ALL' OR (',' || replace(recipient, ' ', '') || ',') LIKE ('%,' || ?1 || ',%')) AND sender != ?1 AND status IN ('sent', 'picked')
                AND NOT EXISTS (SELECT 1 FROM notified n WHERE n.msg_id = m.id)
                AND ?2 = ?2
              ORDER BY hlc_wall_ms ASC, hlc_logical ASC"
         } else {
             "SELECT id, sender, recipient, priority, hint, hlc_wall_ms FROM messages m
-             WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')
+             WHERE (recipient = 'ALL' OR (',' || replace(recipient, ' ', '') || ',') LIKE ('%,' || ?1 || ',%')) AND sender != ?1 AND status IN ('sent', 'picked')
                AND NOT EXISTS (SELECT 1 FROM notified n WHERE n.session = ?2 AND n.msg_id = m.id)
              ORDER BY hlc_wall_ms ASC, hlc_logical ASC"
         };
@@ -467,13 +479,13 @@ impl SqliteProjection {
         let sql = if urgent_only {
             "SELECT id, sender, recipient, priority, hint, hlc_wall_ms
              FROM messages
-             WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1
-               AND (priority = 'urgent' OR recipient = ?1) AND pushed_channel = 0 AND status IN ('sent', 'picked')
+             WHERE (recipient = 'ALL' OR (',' || replace(recipient, ' ', '') || ',') LIKE ('%,' || ?1 || ',%')) AND sender != ?1
+               AND (priority = 'urgent' OR (',' || replace(recipient, ' ', '') || ',') LIKE ('%,' || ?1 || ',%')) AND pushed_channel = 0 AND status IN ('sent', 'picked')
              ORDER BY hlc_wall_ms ASC"
         } else {
             "SELECT id, sender, recipient, priority, hint, hlc_wall_ms
              FROM messages
-             WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1
+             WHERE (recipient = 'ALL' OR (',' || replace(recipient, ' ', '') || ',') LIKE ('%,' || ?1 || ',%')) AND sender != ?1
                AND status = 'sent'
              ORDER BY CASE WHEN priority = 'urgent' THEN 0 ELSE 1 END, hlc_wall_ms ASC"
         };
@@ -523,7 +535,7 @@ impl SqliteProjection {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM messages
-                 WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')",
+                 WHERE (recipient = 'ALL' OR (',' || replace(recipient, ' ', '') || ',') LIKE ('%,' || ?1 || ',%')) AND sender != ?1 AND status IN ('sent', 'picked')",
                 params![agent_id],
                 |r| r.get(0),
             )
@@ -536,7 +548,7 @@ impl SqliteProjection {
         let mut stmt = match guard.conn.prepare(
             "SELECT id, sender, recipient, priority, body_md, hlc_wall_ms
              FROM messages
-             WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')
+             WHERE (recipient = 'ALL' OR (',' || replace(recipient, ' ', '') || ',') LIKE ('%,' || ?1 || ',%')) AND sender != ?1 AND status IN ('sent', 'picked')
              ORDER BY hlc_wall_ms ASC, hlc_logical ASC",
         ) {
             Ok(s) => s,
@@ -976,6 +988,18 @@ mod session_and_roster_tests {
     }
 
     #[test]
+    fn only_mentioned_members_are_notified() {
+        let s = SqliteProjection::open(&db("mention"), 1).unwrap();
+        put(&s, "m", "be,qa");
+        assert_eq!(ids(s.drain_session_hints("be", "s")), vec!["m"], "be는 멘션됨");
+        assert_eq!(ids(s.drain_session_hints("qa", "s-qa")), vec!["m"], "qa도 멘션됨");
+        assert!(s.drain_session_hints("fe", "s-fe").is_empty(), "fe는 멘션 안 됨");
+        assert!(s.drain_session_hints("b", "s-b").is_empty(), "아이디 일부만 같아도 안 됨");
+        assert_eq!(s.unread_count("qa"), 1);
+        assert_eq!(s.unread_count("fe"), 0);
+    }
+
+    #[test]
     fn read_mail_is_not_announced_to_new_sessions() {
         let s = SqliteProjection::open(&db("readsess"), 1).unwrap();
         put(&s, "a", "be");
@@ -994,6 +1018,25 @@ mod session_and_roster_tests {
         let st = s.full_state_json();
         let names: Vec<&str> = st["agents"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["도윤"]);
+    }
+
+    #[test]
+    fn agent_sets_status_and_target_and_they_survive_restart() {
+        let path = db("status");
+        {
+            let s = SqliteProjection::open(&path, 9).unwrap();
+            s.upsert_local_agent("pm", "윤여원", "팀장", "claude-code", "P2P 스웜 협업 중", 10, "working", "ab").unwrap();
+            s.update_local_fields("pm", Some("README 합치는 중"), Some("yyw")).unwrap();
+            let a = &s.full_state_json()["agents"][0];
+            assert_eq!(a["task"], "README 합치는 중");
+            assert_eq!(a["target"], "yyw");
+        }
+        // 데몬 재시작: 시작할 때 기본 문구로 다시 등록해도 에이전트가 정한 값은 남는다
+        let s = SqliteProjection::open(&path, 9).unwrap();
+        s.upsert_local_agent("pm", "윤여원", "팀장", "claude-code", "P2P 스웜 협업 중", 10, "working", "ab").unwrap();
+        let a = &s.full_state_json()["agents"][0];
+        assert_eq!(a["task"], "README 합치는 중");
+        assert_eq!(a["target"], "yyw");
     }
 
     #[test]

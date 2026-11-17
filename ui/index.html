@@ -187,7 +187,9 @@
       } else {
         stream.innerHTML = msgs.map(m => {
           const mine = m.sender === me.agent || (m.sender === 'OVERSEER' && me.is_host);
-          const to = m.recipient && m.recipient !== 'ALL' ? ` → ${esc(nameOf(m.recipient))}에게` : '';
+          const to = m.recipient && m.recipient !== 'ALL'
+            ? ' → ' + m.recipient.split(',').map(x => '@' + esc(nameOf(x.trim()))).join(' ')
+            : '';
           return `<div class="msg ${mine ? 'mine' : ''}">
             ${mine ? '' : `<div class="who">${esc(nameOf(m.sender))}</div>`}
             <div class="bubble ${m.priority === 'urgent' ? 'urgent' : ''}">${esc(m.body_md)}</div>
@@ -203,12 +205,13 @@
       const people = (s.agents || []).slice().sort((a, b) => (a.id === me.agent ? -1 : b.id === me.agent ? 1 : 0));
       $('people').innerHTML = people.length ? people.map(a => {
         const ls = leasesBy[a.id] || [];
-        const files = ls.length ? ls.map(l => `🔒 ${esc(l.glob_pattern)} (${minutesLeft(l)}분 남음)`).join('<br>') : '고치는 중인 파일 없음';
+        const files = ls.length ? ls.map(l => `🔒 ${esc(l.glob_pattern)} (${minutesLeft(l)}분 남음)`).join('<br>') : '';
+        const doing = a.task && a.task !== 'P2P 스웜 협업 중' ? `<div class="pmeta">📝 ${esc(a.task)}</div>` : '';
         const tag = a.id === me.agent ? ' (나)' : (a.role && a.role.startsWith('팀장') ? ' (방장)' : '');
         const presence = a.online ? '<span style="color:var(--ok)">● 접속 중</span>'
           : (a.last_seen_ms ? `<span style="color:var(--muted)">○ ${ago(a.last_seen_ms)} 전</span>` : '<span style="color:var(--muted)">○ 꺼져 있음</span>');
         return `<div class="person"><div class="avatar">${esc((a.name || '?').slice(0, 1))}</div>
-          <div><div class="pname">${esc(a.name)}${tag}</div><div class="pmeta">${presence}</div><div class="pmeta">${files}</div></div></div>`;
+          <div><div class="pname">${esc(a.name)}${tag}</div><div class="pmeta">${presence}</div>${doing}${files ? `<div class="pmeta">${files}</div>` : ''}</div></div>`;
       }).join('') : '<p class="hint">아직 아무도 없어요.</p>';
 
       const sel = $('to'); const keep = sel.value;
