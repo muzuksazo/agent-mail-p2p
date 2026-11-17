@@ -105,7 +105,7 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:18765")]
         daemon_url: String,
         /// stop-wait: 메일을 기다리는 최대 초
-        #[arg(long, default_value_t = 3500)]
+        #[arg(long, default_value_t = 86000)]
         max_secs: u64,
     },
 }

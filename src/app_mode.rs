@@ -395,7 +395,7 @@ pub fn install_claude_hooks(agent: &str, port: u16) -> Result<String> {
         ("PostToolUse", json!({ "type": "command", "command": cmd("post-tool"), "timeout": 10 })),
         ("UserPromptSubmit", json!({ "type": "command", "command": cmd("prompt"), "timeout": 10 })),
         // 답을 마친 뒤 백그라운드로 기다리다가 메일이 오면 종료 코드 2로 세션을 깨운다.
-        ("Stop", json!({ "type": "command", "command": cmd("stop-wait"), "asyncRewake": true, "timeout": 3600 })),
+        ("Stop", json!({ "type": "command", "command": cmd("stop-wait"), "asyncRewake": true, "timeout": 86400 })),
     ];
     for (event, handler) in wanted {
         let groups = hooks.as_object_mut().context("hooks가 객체가 아니에요")?
