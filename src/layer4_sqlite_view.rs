@@ -390,13 +390,25 @@ impl SqliteProjection {
 
     /// 세션별 '새 메일' 알림: 이 세션에 아직 알리지 않았고 아직 읽지 않은 나에게 온 메일.
     pub fn drain_session_hints(&self, agent_id: &str, session: &str) -> Vec<CommittedMailEvent> {
+        self.drain_session_hints_opt(agent_id, session, false)
+    }
+
+    /// fresh_only=true: 아직 어느 세션에도 알리지 않은 메일만(세션 시작 인사가 같은 메일로 반복되지 않게).
+    pub fn drain_session_hints_opt(&self, agent_id: &str, session: &str, fresh_only: bool) -> Vec<CommittedMailEvent> {
         let guard = self.inner.lock().unwrap();
-        let rows: Vec<CommittedMailEvent> = match guard.conn.prepare(
+        let sql = if fresh_only {
+            "SELECT id, sender, recipient, priority, hint, hlc_wall_ms FROM messages m
+             WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')
+               AND NOT EXISTS (SELECT 1 FROM notified n WHERE n.msg_id = m.id)
+               AND ?2 = ?2
+             ORDER BY hlc_wall_ms ASC, hlc_logical ASC"
+        } else {
             "SELECT id, sender, recipient, priority, hint, hlc_wall_ms FROM messages m
              WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')
                AND NOT EXISTS (SELECT 1 FROM notified n WHERE n.session = ?2 AND n.msg_id = m.id)
-             ORDER BY hlc_wall_ms ASC, hlc_logical ASC",
-        ) {
+             ORDER BY hlc_wall_ms ASC, hlc_logical ASC"
+        };
+        let rows: Vec<CommittedMailEvent> = match guard.conn.prepare(sql) {
             Ok(mut stmt) => stmt
                 .query_map(params![agent_id, session], |r| {
                     Ok(CommittedMailEvent {
@@ -950,6 +962,17 @@ mod session_and_roster_tests {
         assert_eq!(ids(s.drain_session_hints("be", "s1")), vec!["a"]);
         assert_eq!(ids(s.drain_session_hints("be", "s2")), vec!["a"], "두 번째 세션도 알림을 받는다");
         assert!(s.drain_session_hints("be", "s1").is_empty(), "같은 세션에는 한 번만");
+    }
+
+    #[test]
+    fn session_start_greets_only_for_mail_no_session_was_told() {
+        let s = SqliteProjection::open(&db("fresh"), 1).unwrap();
+        put(&s, "old", "be");
+        assert_eq!(ids(s.drain_session_hints("be", "s1")), vec!["old"], "기존 세션이 이미 들음");
+        put(&s, "new", "be");
+        assert_eq!(ids(s.drain_session_hints_opt("be", "s2", true)), vec!["new"], "새 세션 인사는 처음 듣는 메일만");
+        assert!(s.drain_session_hints_opt("be", "s3", true).is_empty(), "다음 세션은 조용히");
+        assert_eq!(ids(s.drain_session_hints("be", "s3")), vec!["old", "new"], "말을 걸면 안 읽은 메일은 다 알림");
     }
 
     #[test]

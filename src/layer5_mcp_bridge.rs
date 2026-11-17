@@ -46,6 +46,9 @@ pub struct WaitParams {
     /// Claude 세션 id: 주면 세션마다 따로 '새 메일' 알림을 준다(같은 컴퓨터의 여러 세션).
     #[serde(default)]
     pub session: Option<String>,
+    /// 1이면 아직 어느 세션에도 알리지 않은 메일만(세션 시작 인사용)
+    #[serde(default)]
+    pub fresh: u8,
     #[serde(default)]
     pub urgent_only: u8,
     #[serde(default)]
@@ -153,7 +156,7 @@ async fn api_wait(
     loop {
         let notified = st.store.wake_notify.notified();
         let hints = match (&q.session, urgent_only) {
-            (Some(sess), false) if !sess.is_empty() => st.store.drain_session_hints(&q.agent, sess),
+            (Some(sess), false) if !sess.is_empty() => st.store.drain_session_hints_opt(&q.agent, sess, q.fresh == 1),
             _ => st.store.drain_pending_hints(&q.agent, urgent_only),
         };
         if !hints.is_empty() || q.timeout == 0 {

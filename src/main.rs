@@ -98,7 +98,7 @@ enum Command {
     },
     /// PostToolUse / PreToolUse 라이프사이클 훅 실행
     Hook {
-        /// post-tool | prompt | stop-wait
+        /// post-tool | prompt | stop-wait | session-start
         mode: String,
         #[arg(long)]
         agent: String,
@@ -107,6 +107,9 @@ enum Command {
         /// stop-wait: 메일을 기다리는 최대 초
         #[arg(long, default_value_t = 86000)]
         max_secs: u64,
+        /// session-start: 꺼진 방을 다시 켤 때 쓰는 터미널용 방 폴더(기본 ~/.agent_mail_p2p)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -143,7 +146,8 @@ async fn main() -> Result<()> {
             agent,
             daemon_url,
             max_secs,
-        } => hooks::run(&mode, &agent, &daemon_url, max_secs),
+            data_dir,
+        } => hooks::run(&mode, &agent, &daemon_url, max_secs, data_dir),
 
         Command::Open {
             agent,
@@ -164,6 +168,9 @@ async fn main() -> Result<()> {
             };
             std::fs::create_dir_all(&data_dir)?;
             std::fs::write(&topic_file, data_encoding::HEXLOWER.encode(&topic))?;
+            hooks::save_room_launch(&data_dir, &hooks::RoomLaunch {
+                mode: "open".into(), agent: agent.clone(), name: name.clone(), port, ticket: None,
+            });
             start_host(agent, name, topic, port, data_dir, app_mode::AppInfo::default()).await
         }
 
@@ -175,6 +182,10 @@ async fn main() -> Result<()> {
             port,
             data_dir,
         } => {
+            let _ = std::fs::create_dir_all(&data_dir);
+            hooks::save_room_launch(&data_dir, &hooks::RoomLaunch {
+                mode: "join".into(), agent: agent.clone(), name: name.clone(), port, ticket: Some(ticket.clone()),
+            });
             start_member(ticket, agent, name, allowed_glob, port, data_dir, app_mode::AppInfo::default()).await
         }
     }

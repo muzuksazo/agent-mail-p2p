@@ -386,7 +386,7 @@ pub fn install_claude_hooks(agent: &str, port: u16) -> Result<String> {
     let url = format!("http://127.0.0.1:{port}");
     let cmd = |mode: &str| format!("{exe} hook {mode} --agent {agent} --daemon-url {url}");
     let ours = |h: &Value| {
-        h.get("command").and_then(|c| c.as_str()).map(|c| c.contains(" hook post-tool ") || c.contains(" hook prompt ") || c.contains(" hook stop-wait ")).unwrap_or(false)
+        h.get("command").and_then(|c| c.as_str()).map(|c| c.contains(" hook post-tool ") || c.contains(" hook prompt ") || c.contains(" hook stop-wait ") || c.contains(" hook session-start ")).unwrap_or(false)
             && h.get("command").and_then(|c| c.as_str()).map(|c| c.contains("agent-mail")).unwrap_or(false)
     };
     let hooks = root.as_object_mut().context("settings.json 최상위가 객체가 아니에요")?
@@ -396,6 +396,8 @@ pub fn install_claude_hooks(agent: &str, port: u16) -> Result<String> {
         ("UserPromptSubmit", json!({ "type": "command", "command": cmd("prompt"), "timeout": 10 })),
         // 답을 마친 뒤 백그라운드로 기다리다가 메일이 오면 종료 코드 2로 세션을 깨운다.
         ("Stop", json!({ "type": "command", "command": cmd("stop-wait"), "asyncRewake": true, "timeout": 86400 })),
+        // 세션을 열면 꺼진 방을 다시 켜고, 알릴 메일이 있으면 Claude가 먼저 말을 건다.
+        ("SessionStart", json!({ "type": "command", "command": cmd("session-start"), "asyncRewake": true, "timeout": 60 })),
     ];
     for (event, handler) in wanted {
         let groups = hooks.as_object_mut().context("hooks가 객체가 아니에요")?
