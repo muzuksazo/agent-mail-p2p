@@ -43,6 +43,9 @@ pub struct LocalBridgeState {
 #[derive(Deserialize)]
 pub struct WaitParams {
     pub agent: String,
+    /// Claude 세션 id: 주면 세션마다 따로 '새 메일' 알림을 준다(같은 컴퓨터의 여러 세션).
+    #[serde(default)]
+    pub session: Option<String>,
     #[serde(default)]
     pub urgent_only: u8,
     #[serde(default)]
@@ -149,7 +152,10 @@ async fn api_wait(
 
     loop {
         let notified = st.store.wake_notify.notified();
-        let hints = st.store.drain_pending_hints(&q.agent, urgent_only);
+        let hints = match (&q.session, urgent_only) {
+            (Some(sess), false) if !sess.is_empty() => st.store.drain_session_hints(&q.agent, sess),
+            _ => st.store.drain_pending_hints(&q.agent, urgent_only),
+        };
         if !hints.is_empty() || q.timeout == 0 {
             return Json(json!({ "ok": true, "hints": hints }));
         }

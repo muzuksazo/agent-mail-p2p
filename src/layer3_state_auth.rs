@@ -288,6 +288,7 @@ impl TeamCrdtDoc {
         task: &str,
         progress: i64,
         status: &str,
+        pk_hex: &str,
     ) -> Result<Vec<u8>> {
         let vv_before = self.doc.oplog_vv();
         let agents_map = self.doc.get_map("agents");
@@ -299,6 +300,7 @@ impl TeamCrdtDoc {
             "task": task,
             "progress": progress,
             "status": status,
+            "pk": pk_hex,
         });
         agents_map.insert(agent_id, entry.to_string())?;
         self.doc.commit();

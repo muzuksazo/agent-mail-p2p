@@ -280,6 +280,7 @@ async fn run_p2p_daemon(
         "P2P 스웜 협업 중",
         10,
         "working",
+        &data_encoding::HEXLOWER.encode(&my_pk),
     )?;
 
     let node = Arc::new(P2pTransportNode::bind(iroh_sk, store.clone()).await?);
@@ -403,6 +404,8 @@ async fn run_p2p_daemon(
                 let Ok(kind) = env.verify_and_decode(&effective_root, now_unix_ms()) else {
                     continue;
                 };
+                // 서명이 확인된 신호를 받은 시각 = 그 팀원이 마지막으로 보인 때
+                store_recv.touch_presence(&env.author_pk, now_unix_ms());
 
                 match kind {
                     GossipKind::MailPublished(hdr) => {

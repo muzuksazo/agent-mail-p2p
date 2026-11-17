@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 
 use crate::layer5_mcp_bridge::reqwest_free_http_get;
 
-fn take_hints(daemon_url: &str, agent: &str, timeout_secs: u64) -> Result<Vec<Value>> {
-    let res = reqwest_free_http_get(&format!("{daemon_url}/api/wait?agent={agent}&timeout={timeout_secs}"))?;
+fn take_hints(daemon_url: &str, agent: &str, session: &str, timeout_secs: u64) -> Result<Vec<Value>> {
+    let res = reqwest_free_http_get(&format!("{daemon_url}/api/wait?agent={agent}&session={session}&timeout={timeout_secs}"))?;
     Ok(res.get("hints").and_then(|v| v.as_array()).cloned().unwrap_or_default())
 }
 
@@ -45,6 +45,13 @@ fn read_stdin_json() -> Value {
     serde_json::from_str(&raw).unwrap_or(Value::Null)
 }
 
+/// 훅 입력의 session_id를 URL에 넣어도 안전한 글자만 남겨 쓴다.
+fn session_key(input: &Value) -> String {
+    let raw = input.get("session_id").and_then(|v| v.as_str()).unwrap_or("default");
+    let k: String = raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
+    if k.is_empty() { "default".into() } else { k }
+}
+
 fn wait_marker(agent: &str, session: &str) -> PathBuf {
     let safe: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
     std::env::temp_dir().join(format!("agent-mail-wait-{agent}-{safe}.pid"))
@@ -53,9 +60,9 @@ fn wait_marker(agent: &str, session: &str) -> PathBuf {
 pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64) -> Result<()> {
     match mode {
         "post-tool" | "prompt" => {
-            let _ = read_stdin_json();
+            let session = session_key(&read_stdin_json());
             // 데몬이 꺼져 있으면 아무것도 끼워 넣지 않는다(작업을 방해하지 않음).
-            let Ok(hints) = take_hints(daemon_url, agent, 0) else { return Ok(()) };
+            let Ok(hints) = take_hints(daemon_url, agent, &session, 0) else { return Ok(()) };
             if !hints.is_empty() {
                 let event = if mode == "prompt" { "UserPromptSubmit" } else { "PostToolUse" };
                 println!(
@@ -66,8 +73,7 @@ pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64) -> Result<(
             Ok(())
         }
         "stop-wait" => {
-            let input = read_stdin_json();
-            let session = input.get("session_id").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+            let session = session_key(&read_stdin_json());
             let marker = wait_marker(agent, &session);
             let me = std::process::id().to_string();
             let _ = std::fs::write(&marker, &me);
@@ -77,7 +83,7 @@ pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64) -> Result<(
                 if std::fs::read_to_string(&marker).ok().as_deref() != Some(me.as_str()) {
                     return Ok(());
                 }
-                match take_hints(daemon_url, agent, 25) {
+                match take_hints(daemon_url, agent, &session, 25) {
                     Ok(hints) if !hints.is_empty() => {
                         let _ = std::fs::remove_file(&marker);
                         // asyncRewake: 종료 코드 2 + stderr 내용이 Claude에게 전달되며 세션이 깨어난다.

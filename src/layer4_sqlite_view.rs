@@ -38,7 +38,12 @@ struct InnerState {
     staging_headers: HashMap<[u8; 32], Vec<MailHeader>>,
     pub arbiter: DeterministicLeaseArbiter,
     pub crdt: TeamCrdtDoc,
+    /// 이 노드 자신의 서명 키(hex): 명부에서 '나'는 항상 접속 중으로 보인다.
+    local_pk_hex: Option<String>,
 }
+
+/// 마지막 신호 후 이 시간 안이면 '접속 중'. 각 노드는 15초마다 신호를 보낸다.
+const ONLINE_WINDOW_MS: u64 = 45_000;
 
 pub struct SqliteProjection {
     inner: Mutex<InnerState>,
@@ -85,6 +90,25 @@ impl SqliteProjection {
             );
 
             -- 파일 리스 영속화: 데몬 재시작 후에도 이 노드가 알던 리스 테이블을 그대로 복원한다.
+            -- 세션별 알림 기록: 같은 컴퓨터의 Claude 세션 여러 개가 각자 '새 메일' 알림을 받는다.
+            CREATE TABLE IF NOT EXISTS notified (
+                session TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                PRIMARY KEY (session, msg_id)
+            );
+
+            -- 팀원 명부(Loro 스냅샷) 등 작은 상태 저장소: 재시작해도 꺼진 팀원이 명부에 남는다.
+            CREATE TABLE IF NOT EXISTS kv (
+                key TEXT PRIMARY KEY,
+                val BLOB NOT NULL
+            );
+
+            -- 팀원별 마지막 신호 시각(서명 키 기준)
+            CREATE TABLE IF NOT EXISTS presence (
+                pk_hex TEXT PRIMARY KEY,
+                last_seen_ms INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS leases (
                 glob_pattern TEXT PRIMARY KEY,
                 expires_wall_ms INTEGER NOT NULL,
@@ -94,6 +118,15 @@ impl SqliteProjection {
         )?;
 
         let arbiter = Self::load_leases(&conn)?;
+        let crdt = TeamCrdtDoc::new(peer_id_u64);
+        let saved_roster: Option<Vec<u8>> = conn
+            .query_row("SELECT val FROM kv WHERE key = 'roster'", [], |r| r.get(0))
+            .ok();
+        if let Some(bytes) = saved_roster {
+            if let Err(e) = crdt.import_delta(&bytes) {
+                tracing::warn!("Ignoring unreadable saved roster: {e}");
+            }
+        }
 
         let (event_tx, _) = broadcast::channel(256);
         Ok(Self {
@@ -101,7 +134,8 @@ impl SqliteProjection {
                 conn,
                 staging_headers: HashMap::new(),
                 arbiter,
-                crdt: TeamCrdtDoc::new(peer_id_u64),
+                crdt,
+                local_pk_hex: None,
             }),
             wake_notify: Notify::new(),
             event_tx,
@@ -325,13 +359,70 @@ impl SqliteProjection {
         guard.crdt.export_snapshot()
     }
 
+    fn save_roster(state: &InnerState) {
+        if let Ok(snapshot) = state.crdt.export_snapshot() {
+            let _ = state.conn.execute(
+                "INSERT INTO kv (key, val) VALUES ('roster', ?1) ON CONFLICT(key) DO UPDATE SET val = excluded.val",
+                params![snapshot],
+            );
+        }
+    }
+
     pub fn merge_loro_delta(&self, delta: &[u8]) -> Result<()> {
         {
             let guard = self.inner.lock().unwrap();
             guard.crdt.import_delta(delta)?;
+            Self::save_roster(&guard);
         }
         self.wake_notify.notify_waiters();
         Ok(())
+    }
+
+    /// 서명 키가 pk인 팀원에게서 신호를 받았다(가십 봉투 검증 직후 호출).
+    pub fn touch_presence(&self, pk: &[u8; 32], now_ms: u64) {
+        let guard = self.inner.lock().unwrap();
+        let _ = guard.conn.execute(
+            "INSERT INTO presence (pk_hex, last_seen_ms) VALUES (?1, ?2)
+             ON CONFLICT(pk_hex) DO UPDATE SET last_seen_ms = MAX(last_seen_ms, excluded.last_seen_ms)",
+            params![data_encoding::HEXLOWER.encode(pk), now_ms as i64],
+        );
+    }
+
+    /// 세션별 '새 메일' 알림: 이 세션에 아직 알리지 않았고 아직 읽지 않은 나에게 온 메일.
+    pub fn drain_session_hints(&self, agent_id: &str, session: &str) -> Vec<CommittedMailEvent> {
+        let guard = self.inner.lock().unwrap();
+        let rows: Vec<CommittedMailEvent> = match guard.conn.prepare(
+            "SELECT id, sender, recipient, priority, hint, hlc_wall_ms FROM messages m
+             WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')
+               AND NOT EXISTS (SELECT 1 FROM notified n WHERE n.session = ?2 AND n.msg_id = m.id)
+             ORDER BY hlc_wall_ms ASC, hlc_logical ASC",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map(params![agent_id, session], |r| {
+                    Ok(CommittedMailEvent {
+                        id: r.get(0)?,
+                        sender: r.get(1)?,
+                        recipient: r.get(2)?,
+                        priority: r.get(3)?,
+                        hint: r.get(4)?,
+                        created_ms: r.get::<_, i64>(5)? as u64,
+                    })
+                })
+                .map(|it| it.filter_map(|x| x.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        for item in &rows {
+            let _ = guard.conn.execute(
+                "INSERT OR IGNORE INTO notified (session, msg_id) VALUES (?1, ?2)",
+                params![session, item.id],
+            );
+            let _ = guard.conn.execute(
+                "UPDATE messages SET status = 'picked' WHERE id = ?1 AND status = 'sent'",
+                params![item.id],
+            );
+        }
+        rows
     }
 
     pub fn upsert_local_agent(
@@ -343,12 +434,16 @@ impl SqliteProjection {
         task: &str,
         progress: i64,
         status: &str,
+        pk_hex: &str,
     ) -> Result<Vec<u8>> {
         let delta = {
-            let guard = self.inner.lock().unwrap();
-            guard
+            let mut guard = self.inner.lock().unwrap();
+            guard.local_pk_hex = Some(pk_hex.to_string());
+            let delta = guard
                 .crdt
-                .upsert_agent_state(agent_id, name, role, engine, task, progress, status)?
+                .upsert_agent_state(agent_id, name, role, engine, task, progress, status, pk_hex)?;
+            Self::save_roster(&guard);
+            delta
         };
         self.wake_notify.notify_waiters();
         Ok(delta)
@@ -467,7 +562,22 @@ impl SqliteProjection {
         let mut guard = self.inner.lock().unwrap();
         let now = now_unix_ms();
         let leases = guard.arbiter.snapshot(now);
-        let agents = guard.crdt.list_agents_json();
+        let mut agents = guard.crdt.list_agents_json();
+        for a in agents.iter_mut() {
+            let pk = a.get("pk").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let is_me = !pk.is_empty() && guard.local_pk_hex.as_deref() == Some(pk.as_str());
+            let seen: Option<i64> = if pk.is_empty() {
+                None
+            } else {
+                guard.conn.query_row("SELECT last_seen_ms FROM presence WHERE pk_hex = ?1", params![pk], |r| r.get(0)).ok()
+            };
+            let last_seen = if is_me { Some(now as i64) } else { seen };
+            a["last_seen_ms"] = serde_json::json!(last_seen);
+            a["online"] = serde_json::json!(last_seen.map(|t| now.saturating_sub(t as u64) <= ONLINE_WINDOW_MS).unwrap_or(false));
+            if let Some(obj) = a.as_object_mut() {
+                obj.remove("pk");
+            }
+        }
 
         let mut msgs = Vec::new();
         if let Ok(mut stmt) = guard.conn.prepare(
@@ -804,5 +914,79 @@ mod inbox_tests {
         put(&s, "n", "pm", "ALL", false, "chatter");
         let pushed: Vec<String> = s.drain_pending_hints("be", true).into_iter().map(|e| e.id).collect();
         assert_eq!(pushed, vec!["u", "d"]);
+    }
+}
+
+#[cfg(test)]
+mod session_and_roster_tests {
+    use super::*;
+    use crate::layer2_reconcile::{MailHeader, MailPriority};
+    use crate::layer3_state_auth::HlcTimestamp;
+
+    fn db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("amp2p-sr-{}-{}-{}", name, std::process::id(), now_unix_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("m.sqlite3")
+    }
+
+    fn put(s: &SqliteProjection, id: &str, to: &str) {
+        let body = format!("body {id}");
+        let hdr = MailHeader {
+            id: id.into(), sender_agent: "pm".into(), recipient: to.into(), priority: MailPriority::Normal,
+            hint: body.clone(), body_blake3: *blake3::hash(body.as_bytes()).as_bytes(), body_len: body.len() as u32,
+            inline_body: Some(body.clone()), hlc: HlcTimestamp { wall_ms: now_unix_ms(), logical: 0, node_tag: [0; 8] },
+        };
+        s.commit_verified_mail(&hdr, &body).unwrap();
+    }
+
+    fn ids(v: Vec<CommittedMailEvent>) -> Vec<String> {
+        v.into_iter().map(|e| e.id).collect()
+    }
+
+    #[test]
+    fn every_session_gets_its_own_notice() {
+        let s = SqliteProjection::open(&db("sess"), 1).unwrap();
+        put(&s, "a", "be");
+        assert_eq!(ids(s.drain_session_hints("be", "s1")), vec!["a"]);
+        assert_eq!(ids(s.drain_session_hints("be", "s2")), vec!["a"], "두 번째 세션도 알림을 받는다");
+        assert!(s.drain_session_hints("be", "s1").is_empty(), "같은 세션에는 한 번만");
+    }
+
+    #[test]
+    fn read_mail_is_not_announced_to_new_sessions() {
+        let s = SqliteProjection::open(&db("readsess"), 1).unwrap();
+        put(&s, "a", "be");
+        assert_eq!(s.read_inbox("be").len(), 1);
+        assert!(s.drain_session_hints("be", "late").is_empty());
+    }
+
+    #[test]
+    fn roster_survives_restart() {
+        let path = db("roster");
+        {
+            let s = SqliteProjection::open(&path, 7).unwrap();
+            s.upsert_local_agent("be", "도윤", "팀원", "claude-code", "", 0, "working", "aa").unwrap();
+        }
+        let s = SqliteProjection::open(&path, 7).unwrap();
+        let st = s.full_state_json();
+        let names: Vec<&str> = st["agents"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["도윤"]);
+    }
+
+    #[test]
+    fn presence_follows_last_signal() {
+        // 다른 컴퓨터(노드 2)의 팀원 '지호'가 명부로 들어온 상황
+        let remote = SqliteProjection::open(&db("presence-remote"), 2).unwrap();
+        let delta = remote.upsert_local_agent("qa", "지호", "팀원", "claude-code", "", 0, "working", &"11".repeat(32)).unwrap();
+        let s = SqliteProjection::open(&db("presence"), 1).unwrap();
+        s.merge_loro_delta(&delta).unwrap();
+        let pk = [0x11u8; 32];
+        s.touch_presence(&pk, now_unix_ms() - 10 * 60_000);
+        let a = &s.full_state_json()["agents"][0];
+        assert_eq!(a["online"], false, "10분 전 신호면 꺼짐");
+        s.touch_presence(&pk, now_unix_ms());
+        let a = &s.full_state_json()["agents"][0];
+        assert_eq!(a["online"], true, "방금 신호면 접속 중");
+        assert!(a["last_seen_ms"].as_u64().unwrap() > 0);
     }
 }
