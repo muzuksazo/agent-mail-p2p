@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>팀플 5인 AI 단톡방 · 실시간 Hybrid Agent Mail 대시보드</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <style>
+    body {
+      font-family: 'Inter', 'Apple SD Gothic Neo', 'Malgun Gothic', system-ui, -apple-system, sans-serif;
+    }
+    .chat-scroll::-webkit-scrollbar { width: 6px; }
+    .chat-scroll::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.45); border-radius: 9999px; }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-900 min-h-screen flex flex-col">
+
+  <header class="bg-white border-b border-slate-200 sticky top-0 z-30">
+    <div class="max-w-7xl mx-auto px-4 h-14 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-2.5 min-w-0">
+        <div class="w-9 h-9 rounded-2xl bg-indigo-600 text-white flex items-center justify-center font-bold text-xs shrink-0">
+          LIVE
+        </div>
+        <div class="min-w-0">
+          <div class="flex items-center gap-2">
+            <h1 id="missionTitle" class="font-bold text-sm sm:text-base truncate">로딩 중...</h1>
+            <span id="sseStatus" class="px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+              SSE 실시간 연결됨
+            </span>
+          </div>
+          <p class="text-xs text-slate-500 truncate">SQLite WAL + Claude Channel Push + Wake/PostToolUse 훅 연동</p>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2 shrink-0">
+        <button id="btnResetSeed" type="button" class="px-3 py-1.5 rounded-xl text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-700 transition">
+          + 새 팀플 주제 5인 분담
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="flex-1 max-w-7xl w-full mx-auto p-3 sm:p-4 grid grid-cols-1 lg:grid-cols-12 gap-4">
+    <!-- 단톡방 영역 -->
+    <section class="lg:col-span-7 bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col h-[calc(100vh-5.5rem)] min-h-[540px] overflow-hidden">
+      <div id="approvalBanner" class="bg-amber-50 border-b border-amber-200 px-4 py-2.5"></div>
+
+      <div id="chatStream" class="flex-1 overflow-y-auto chat-scroll bg-[#e9eff7] px-4 py-4 space-y-3"></div>
+
+      <div class="bg-white border-t border-slate-200 p-3 space-y-2">
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <span class="text-xs text-slate-500">팀장(OVERSEER) 서명 토큰으로 안전하게 발신됩니다</span>
+          <button id="btnUrgentToggle" type="button" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border bg-slate-50 text-slate-700 border-slate-200">
+            <span id="urgentDot" class="w-2 h-2 rounded-full bg-indigo-500"></span>
+            <span id="urgentLabel">Track 2 · 일반 톡 (Wake/Hook 큐잉)</span>
+          </button>
+        </div>
+
+        <form id="sendForm" class="flex items-center gap-2">
+          <select id="recipientSelect" class="px-2.5 py-2 rounded-xl border border-slate-200 bg-slate-50 text-xs font-semibold text-slate-700">
+            <option value="ALL">@전체 (5명)</option>
+            <option value="pm">@민준 (pm)</option>
+            <option value="fe">@서연 (fe)</option>
+            <option value="be">@도윤 (be)</option>
+            <option value="db">@하은 (db)</option>
+            <option value="qa">@지호 (qa)</option>
+          </select>
+          <input id="msgInput" type="text" placeholder="실제 실행 중인 에이전트에게 지시를 전송하세요..." class="flex-1 px-3.5 py-2 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          <button type="submit" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs sm:text-sm font-semibold">전송</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- 5인 작업 분담 & 리스 현황 보드 -->
+    <aside class="lg:col-span-5 flex flex-col gap-3 h-[calc(100vh-5.5rem)] min-h-[540px] overflow-y-auto chat-scroll pr-0.5">
+      <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="font-bold text-sm text-slate-900">5인 실시간 세션 &amp; 파일 리스 현황</h2>
+          <span id="avgProgress" class="text-lg font-extrabold text-indigo-600 tabular-nums">0%</span>
+        </div>
+        <div class="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+          <div id="avgBar" class="h-full bg-indigo-600 rounded-full transition-all duration-300" style="width: 0%;"></div>
+        </div>
+      </div>
+      <div id="agentsList" class="space-y-2.5 pb-2"></div>
+    </aside>
+  </main>
+
+  <!-- 새 팀플 주제 모달 -->
+  <div id="seedModal" class="fixed inset-0 bg-slate-900/50 z-50 hidden items-center justify-center p-4">
+    <div class="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl space-y-4">
+      <h3 class="font-bold text-base text-slate-900">새 팀플 주제 5인 초기화</h3>
+      <input id="seedTitleInput" type="text" value="실시간 쇼핑몰 타임딜 팀플" class="w-full px-3.5 py-2 rounded-xl border border-slate-200 text-sm" />
+      <div class="flex justify-end gap-2">
+        <button id="btnSeedCancel" type="button" class="px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-slate-100 text-slate-700">취소</button>
+        <button id="btnSeedConfirm" type="button" class="px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-indigo-600 text-white">초기화 실행</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const OVERSEER_TOKEN = "__OVERSEER_TOKEN__";
+    const COLORS = { pm: 'bg-indigo-600', fe: 'bg-pink-600', be: 'bg-sky-600', db: 'bg-amber-600', qa: 'bg-emerald-600' };
+    let urgentMode = false;
+    let currentState = { agents: [], leases: [], approvals: [], messages: [] };
+
+    function esc(s) {
+      return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function fmtTime(ts) {
+      if (!ts) return '';
+      const d = new Date(ts * 1000);
+      return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+    }
+
+    async function apiPost(path, body) {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Overseer-Token': OVERSEER_TOKEN },
+        body: JSON.stringify(body)
+      });
+      return res.json();
+    }
+
+    function render(snap) {
+      currentState = snap;
+      document.getElementById('missionTitle').textContent = snap.mission_title || '5인 팀플 단톡방';
+
+      // 결재 배너
+      const banner = document.getElementById('approvalBanner');
+      if (!snap.approvals || snap.approvals.length === 0) {
+        banner.className = 'bg-emerald-50 border-b border-emerald-200 px-4 py-2 text-xs text-emerald-800 font-medium';
+        banner.innerHTML = '결재 대기 0건 · 모든 에이전트가 정상 협업 중입니다.';
+      } else {
+        const ap = snap.approvals[0];
+        banner.className = 'bg-amber-50 border-b border-amber-200 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2';
+        banner.innerHTML = `
+          <div>
+            <span class="px-2 py-0.5 rounded-full bg-amber-500 text-white text-[11px] font-bold mr-1.5">Needs You (${snap.approvals.length})</span>
+            <span class="text-xs font-bold text-amber-950">@${esc(ap.agent_id)}: ${esc(ap.question)}</span>
+          </div>
+          <div class="flex gap-1.5">
+            <button type="button" data-ap="${esc(ap.id)}" data-ch="yes" class="ap-btn px-3 py-1 rounded-xl bg-indigo-600 text-white text-xs font-bold">${esc(ap.yes_label)}</button>
+            <button type="button" data-ap="${esc(ap.id)}" data-ch="no" class="ap-btn px-3 py-1 rounded-xl bg-white border border-amber-300 text-amber-900 text-xs font-semibold">${esc(ap.no_label)}</button>
+          </div>
+        `;
+        banner.querySelectorAll('.ap-btn').forEach(b => {
+          b.addEventListener('click', () => apiPost('/api/approval/resolve', { approval_id: b.dataset.ap, choice: b.dataset.ch }));
+        });
+      }
+
+      // 메시지 렌더링
+      const agentMap = Object.fromEntries((snap.agents || []).map(a => [a.id, a]));
+      const leaseMap = {};
+      (snap.leases || []).forEach(l => { leaseMap[l.holder_agent] = l; });
+
+      const stream = document.getElementById('chatStream');
+      stream.innerHTML = (snap.messages || []).map(m => {
+        if (m.sender === 'OVERSEER') {
+          let rc = '<span class="text-emerald-600 font-semibold">읽음 · Ack 완료</span>';
+          if (m.status === 'sent') {
+            rc = `<div class="flex items-center gap-1.5"><button type="button" data-wd="${esc(m.id)}" class="wd-btn px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 font-semibold">전송 취소</button><span class="text-amber-600 font-bold">안 읽음</span></div>`;
+          } else if (m.status === 'picked') {
+            rc = '<span class="text-indigo-600 font-semibold">힌트 주입됨 (Picked)</span>';
+          }
+          return `
+            <div class="flex justify-end items-end gap-2">
+              <div class="text-[11px] text-right">${rc}<div class="text-slate-400">${fmtTime(m.created_at)}</div></div>
+              <div class="max-w-[72%] rounded-2xl rounded-tr-sm px-3.5 py-2.5 shadow-sm text-sm ${m.priority === 'urgent' ? 'bg-rose-600 text-white' : 'bg-amber-300 text-slate-900'}">
+                <div class="text-[11px] font-mono font-bold opacity-85 mb-0.5">[${esc(m.route_tag)}] → @${esc(m.recipient)}</div>
+                <p class="break-words">${esc(m.body_md)}</p>
+              </div>
+            </div>
+          `;
+        }
+        const ag = agentMap[m.sender] || { name: m.sender, role: '에이전트', engine: 'mcp' };
+        const col = COLORS[m.sender] || 'bg-slate-600';
+        return `
+          <div class="flex items-start gap-2.5">
+            <div class="w-9 h-9 rounded-2xl ${col} text-white flex items-center justify-center font-bold text-xs shrink-0 mt-0.5">${esc(ag.name)}</div>
+            <div class="max-w-[75%]">
+              <div class="flex items-center gap-1.5 mb-1 flex-wrap">
+                <span class="text-xs font-bold text-slate-800">${esc(ag.name)}</span>
+                <span class="text-[11px] text-slate-500">${esc(ag.role)}</span>
+                <span class="px-1.5 py-0.5 rounded bg-white text-slate-600 text-[10px] font-mono border border-slate-200">${esc(ag.engine)}</span>
+              </div>
+              <div class="flex items-end gap-1.5">
+                <div class="bg-white rounded-2xl rounded-tl-sm px-3.5 py-2.5 shadow-sm border border-slate-200 text-sm text-slate-800">
+                  <p class="break-words">${esc(m.body_md)}</p>
+                </div>
+                <span class="text-[11px] text-slate-400 shrink-0">${fmtTime(m.created_at)}</span>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+      stream.scrollTop = stream.scrollHeight;
+
+      stream.querySelectorAll('.wd-btn').forEach(b => {
+        b.addEventListener('click', () => apiPost('/api/withdraw', { msg_id: b.dataset.wd }));
+      });
+
+      // 5인 보드
+      const agents = snap.agents || [];
+      const avg = agents.length ? Math.round(agents.reduce((s, a) => s + (a.progress || 0), 0) / agents.length) : 0;
+      document.getElementById('avgProgress').textContent = `${avg}%`;
+      document.getElementById('avgBar').style.width = `${avg}%`;
+
+      document.getElementById('agentsList').innerHTML = agents.map((a, idx) => {
+        const lease = leaseMap[a.id];
+        const col = COLORS[a.id] || 'bg-slate-600';
+        return `
+          <div class="bg-white rounded-2xl border border-slate-200 p-3.5 shadow-sm space-y-2">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="w-7 h-7 rounded-xl ${col} text-white flex items-center justify-center text-xs font-bold">${idx + 1}</span>
+                <div>
+                  <div class="text-sm font-bold">${esc(a.name)} <span class="text-xs font-normal text-slate-500">(${esc(a.id)} · ${esc(a.role)})</span></div>
+                  <div class="text-[11px] font-mono text-slate-400">${esc(a.engine)} · ${a.supports_channel ? 'Channel Push 활성' : 'Wake/Hook 활성'}</div>
+                </div>
+              </div>
+              <span class="px-2 py-0.5 rounded-full text-[11px] font-bold ${a.status === 'blocked' ? 'bg-amber-100 text-amber-800' : 'bg-indigo-50 text-indigo-700'}">${esc(a.status)}</span>
+            </div>
+            <div class="text-xs bg-slate-50 rounded-xl px-3 py-2 text-slate-700">${esc(a.task)}</div>
+            <div class="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+              <div class="h-full bg-indigo-600 rounded-full" style="width: ${a.progress || 0}%;"></div>
+            </div>
+            <div class="text-[11px] font-mono text-slate-600">
+              파일 리스: ${lease ? esc(lease.glob_pattern) + ' (' + lease.remaining_minutes + 'm 남음)' : '없음'}
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    document.getElementById('btnUrgentToggle').addEventListener('click', () => {
+      urgentMode = !urgentMode;
+      const btn = document.getElementById('btnUrgentToggle');
+      const dot = document.getElementById('urgentDot');
+      const lbl = document.getElementById('urgentLabel');
+      if (urgentMode) {
+        btn.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold border bg-rose-50 text-rose-700 border-rose-300';
+        dot.className = 'w-2 h-2 rounded-full bg-rose-600 animate-ping';
+        lbl.textContent = 'Track 1 · 긴급 푸시 (Channel Push 즉시 중단·수신)';
+      } else {
+        btn.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border bg-slate-50 text-slate-700 border-slate-200';
+        dot.className = 'w-2 h-2 rounded-full bg-indigo-500';
+        lbl.textContent = 'Track 2 · 일반 톡 (Wake/Hook 큐잉)';
+      }
+    });
+
+    document.getElementById('sendForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const inp = document.getElementById('msgInput');
+      const txt = inp.value.trim();
+      if (!txt) return;
+      inp.value = '';
+      await apiPost('/api/send', {
+        sender: 'OVERSEER',
+        recipient: document.getElementById('recipientSelect').value,
+        body_md: txt,
+        hint: txt,
+        priority: urgentMode ? 'urgent' : 'normal'
+      });
+    });
+
+    const seedModal = document.getElementById('seedModal');
+    document.getElementById('btnResetSeed').addEventListener('click', () => {
+      seedModal.classList.remove('hidden');
+      seedModal.classList.add('flex');
+    });
+    document.getElementById('btnSeedCancel').addEventListener('click', () => {
+      seedModal.classList.add('hidden');
+      seedModal.classList.remove('flex');
+    });
+    document.getElementById('btnSeedConfirm').addEventListener('click', async () => {
+      const title = document.getElementById('seedTitleInput').value.trim() || '5인 팀플 프로젝트';
+      await apiPost('/api/seed-team', { mission_title: title });
+      seedModal.classList.add('hidden');
+      seedModal.classList.remove('flex');
+    });
+
+    // 초기 스냅샷 로드 후 SSE 실시간 구독
+    fetch('/api/state').then(r => r.json()).then(render);
+    const es = new EventSource('/api/events');
+    es.onmessage = ev => {
+      try { render(JSON.parse(ev.data)); } catch (err) {}
+    };
+    es.onerror = () => {
+      document.getElementById('sseStatus').textContent = '재연결 중...';
+    };
+  </script>
+</body>
+</html>

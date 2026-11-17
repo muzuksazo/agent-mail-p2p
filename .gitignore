@@ -1,0 +1,6 @@
+/target/
+*.key
+*.sqlite3
+*.sqlite3-*
+.agent_mail*/
+.DS_Store
