@@ -112,6 +112,9 @@ impl ProtocolHandler for SyncBlobProtocol {
                     }
                 }
             }
+            // 연결을 여기서 바로 버리면 QUIC이 즉시 닫혀 아직 전달되지 않은 응답이 사라진다.
+            // 요청한 쪽이 응답을 다 읽고 연결을 닫을 때까지 기다린다(상대가 사라진 경우 대비 10초 제한).
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), connection.closed()).await;
         });
         Ok(())
     }

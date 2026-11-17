@@ -303,6 +303,17 @@ impl SqliteProjection {
         ok
     }
 
+    /// 이 에이전트가 쥐고 있는 유효한 리스 목록(주기적 재공지용).
+    pub fn leases_held_by(&self, agent_id: &str) -> Vec<LeaseClaim> {
+        let mut guard = self.inner.lock().unwrap();
+        guard
+            .arbiter
+            .snapshot(now_unix_ms())
+            .into_iter()
+            .filter(|c| c.holder_agent == agent_id)
+            .collect()
+    }
+
     pub fn check_path_conflict(&self, agent_id: &str, path: &str) -> Option<LeaseClaim> {
         let mut guard = self.inner.lock().unwrap();
         guard.arbiter.check_path(agent_id, path, now_unix_ms())

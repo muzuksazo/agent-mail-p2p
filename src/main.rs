@@ -304,9 +304,15 @@ async fn run_p2p_daemon(
     // 2) 주기적 안티엔트로피 비콘: 15초마다 전체 시간 범위의 XOR 지문을 브로드캐스트해 누락을 즉시 감지
     let store_beacon = store.clone();
     let beacon_tx = gossip_out_tx.clone();
+    let beacon_agent = agent_id.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(15)).await;
+            // 리스는 범위 동기화 대상이 아니므로, 쥐고 있는 쪽이 주기적으로 다시 알린다.
+            // 늦게 합류했거나 재시작한 팀원도 다음 주기 안에 같은 리스 테이블로 수렴한다(같은 클레임은 멱등).
+            for claim in store_beacon.leases_held_by(&beacon_agent) {
+                let _ = beacon_tx.send(GossipKind::LeaseAnnounced(claim)).await;
+            }
             let range = TimeRange {
                 start_ms: 0,
                 end_ms: now_unix_ms() + 60_000,
@@ -402,10 +408,7 @@ async fn run_p2p_daemon(
                                 let st = store_recv.clone();
                                 let nd = node_recv.clone();
                                 tokio::spawn(async move {
-                                    if let Ok(ReconcileResponse::MissingEntries {
-                                        entries,
-                                        loro_snapshot,
-                                    }) = nd
+                                    let r = nd
                                         .request_reconcile(
                                             peer,
                                             &ReconcileRequest::FetchRangeEntries {
@@ -413,7 +416,14 @@ async fn run_p2p_daemon(
                                                 known_ids: Vec::new(),
                                             },
                                         )
-                                        .await
+                                        .await;
+                                    if let Err(e) = &r {
+                                        tracing::warn!("range reconcile with bootstrap peer failed: {e:#}");
+                                    }
+                                    if let Ok(ReconcileResponse::MissingEntries {
+                                        entries,
+                                        loro_snapshot,
+                                    }) = r
                                     {
                                         let _ = st.merge_loro_delta(&loro_snapshot);
                                         for (hdr, body) in entries {
