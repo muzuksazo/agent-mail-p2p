@@ -1,6 +1,6 @@
 [package]
 name = "agent-mail-p2p"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "5-Layer Local-First P2P Multi-Agent Collaboration & Hybrid MCP Bus (Iroh QUIC + Gossip + Range Sync + Loro CRDT + HLC Lease + SQLite WAL)"
 license = "MIT OR Apache-2.0"

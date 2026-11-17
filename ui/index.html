@@ -227,7 +227,7 @@
               <div class="h-full bg-indigo-600 rounded-full" style="width: ${a.progress || 0}%;"></div>
             </div>
             <div class="text-[11px] font-mono text-slate-600">
-              파일 리스: ${lease ? esc(lease.glob_pattern) + ' (' + lease.remaining_minutes + 'm 남음)' : '없음'}
+              파일 리스: ${lease ? esc(lease.glob_pattern) + ' (' + Math.max(0, Math.ceil((Number(lease.expires_wall_ms) - Date.now()) / 60000)) + '분 남음)' : '없음'}
             </div>
           </div>
         `;
