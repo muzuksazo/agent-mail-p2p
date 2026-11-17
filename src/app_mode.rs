@@ -370,46 +370,102 @@ fn find_claude() -> Option<PathBuf> {
     }
 }
 
-pub async fn api_connect_claude(State(st): State<Arc<LocalBridgeState>>) -> Json<Value> {
-    let command = claude_command_line(&st);
-    let Some(claude) = find_claude() else {
-        return Json(json!({
-            "ok": false,
-            "reason": "no_claude",
-            "message": "이 맥에서 Claude Code를 찾지 못했어요. Claude Code를 설치했다면 아래 명령을 터미널에 붙여 넣어 주세요.",
-            "command": command,
-        }));
+/// ~/.claude/settings.json에 받기용 훅 3개를 넣는다. 다른 훅은 건드리지 않고,
+/// 예전에 넣은 agent-mail 훅만 바꾼다. 쓰기 전에 원본을 백업한다.
+pub fn install_claude_hooks(agent: &str, port: u16) -> Result<String> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let path = PathBuf::from(&home).join(".claude/settings.json");
+    let mut root: Value = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).context("~/.claude/settings.json이 올바른 JSON이 아니에요")?,
+        Err(_) => json!({}),
     };
-    // 이미 등록돼 있으면 add가 실패하므로 먼저 지운다(없으면 무시).
-    let _ = std::process::Command::new(&claude)
-        .args(["mcp", "remove", "agent-mail", "-s", "user"])
-        .output();
-    let mut add_args: Vec<String> = ["mcp", "add", "-s", "user", "agent-mail", "--"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    add_args.push(current_exe_string());
-    add_args.extend(mcp_args(&st));
-    match std::process::Command::new(&claude).args(&add_args).output() {
-        Ok(out) if out.status.success() => Json(json!({
-            "ok": true,
-            "message": "Claude Code에 연결했어요. Claude Code를 새로 열면 단톡방 도구가 보여요.",
-        })),
-        Ok(out) => Json(json!({
-            "ok": false,
-            "reason": "add_failed",
-            "message": "연결하지 못했어요. 아래 명령을 터미널에 붙여 넣어 주세요.",
-            "detail": String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            "command": command,
-        })),
-        Err(e) => Json(json!({
-            "ok": false,
-            "reason": "spawn_failed",
-            "message": "연결하지 못했어요. 아래 명령을 터미널에 붙여 넣어 주세요.",
-            "detail": e.to_string(),
-            "command": command,
-        })),
+    if path.exists() {
+        std::fs::copy(&path, path.with_extension("json.agent-mail-backup"))?;
     }
+    let exe = shell_quote(&current_exe_string());
+    let url = format!("http://127.0.0.1:{port}");
+    let cmd = |mode: &str| format!("{exe} hook {mode} --agent {agent} --daemon-url {url}");
+    let ours = |h: &Value| {
+        h.get("command").and_then(|c| c.as_str()).map(|c| c.contains(" hook post-tool ") || c.contains(" hook prompt ") || c.contains(" hook stop-wait ")).unwrap_or(false)
+            && h.get("command").and_then(|c| c.as_str()).map(|c| c.contains("agent-mail")).unwrap_or(false)
+    };
+    let hooks = root.as_object_mut().context("settings.json 최상위가 객체가 아니에요")?
+        .entry("hooks").or_insert_with(|| json!({}));
+    let wanted = [
+        ("PostToolUse", json!({ "type": "command", "command": cmd("post-tool"), "timeout": 10 })),
+        ("UserPromptSubmit", json!({ "type": "command", "command": cmd("prompt"), "timeout": 10 })),
+        // 답을 마친 뒤 백그라운드로 기다리다가 메일이 오면 종료 코드 2로 세션을 깨운다.
+        ("Stop", json!({ "type": "command", "command": cmd("stop-wait"), "asyncRewake": true, "timeout": 3600 })),
+    ];
+    for (event, handler) in wanted {
+        let groups = hooks.as_object_mut().context("hooks가 객체가 아니에요")?
+            .entry(event).or_insert_with(|| json!([]));
+        let arr = groups.as_array_mut().context("hook 목록이 배열이 아니에요")?;
+        for g in arr.iter_mut() {
+            if let Some(list) = g.get_mut("hooks").and_then(|l| l.as_array_mut()) {
+                list.retain(|h| !ours(h));
+            }
+        }
+        arr.retain(|g| g.get("hooks").and_then(|l| l.as_array()).map(|l| !l.is_empty()).unwrap_or(true));
+        arr.push(json!({ "hooks": [handler] }));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&root)?)?;
+    Ok(path.display().to_string())
+}
+
+/// MCP 등록 + 받기용 훅 설치를 한 번에 한다(앱 버튼과 CLI `connect-claude`가 같이 쓴다).
+pub fn connect_claude(agent: &str, port: u16) -> Value {
+    let mut args = vec!["mcp".to_string(), "--agent".to_string(), agent.to_string()];
+    if port != 18765 {
+        args.push("--daemon-url".into());
+        args.push(format!("http://127.0.0.1:{port}"));
+    }
+    let mut parts = vec!["claude", "mcp", "add", "-s", "user", "agent-mail", "--"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    parts.push(shell_quote(&current_exe_string()));
+    parts.extend(args.iter().cloned());
+    let command = parts.join(" ");
+
+    let hooks = install_claude_hooks(agent, port);
+    let Some(claude) = find_claude() else {
+        return json!({
+            "ok": false, "reason": "no_claude",
+            "message": "이 컴퓨터에서 Claude Code를 찾지 못했어요. 설치했다면 아래 명령을 터미널에 붙여 넣어 주세요.",
+            "command": command,
+            "hooks_installed": hooks.is_ok(),
+        });
+    };
+    let _ = std::process::Command::new(&claude).args(["mcp", "remove", "agent-mail", "-s", "user"]).output();
+    let mut add_args: Vec<String> = ["mcp", "add", "-s", "user", "agent-mail", "--"].iter().map(|s| s.to_string()).collect();
+    add_args.push(current_exe_string());
+    add_args.extend(args);
+    let added = std::process::Command::new(&claude).args(&add_args).output();
+    match (added, hooks) {
+        (Ok(out), Ok(settings)) if out.status.success() => json!({
+            "ok": true,
+            "message": "Claude Code에 연결했어요. Claude Code를 새로 열면 단톡방 메일을 받을 수 있어요 (쉬고 있어도 새 메일이 오면 깨어나요).",
+            "settings": settings,
+        }),
+        (Ok(out), Ok(_)) => json!({
+            "ok": false, "reason": "add_failed",
+            "message": "받기 설정은 했지만 도구 연결에 실패했어요. 아래 명령을 터미널에 붙여 넣어 주세요.",
+            "detail": String::from_utf8_lossy(&out.stderr).trim().to_string(), "command": command,
+        }),
+        (_, Err(e)) => json!({
+            "ok": false, "reason": "hooks_failed",
+            "message": "Claude 설정 파일을 고치지 못했어요.", "detail": e.to_string(), "command": command,
+        }),
+        (Err(e), _) => json!({
+            "ok": false, "reason": "spawn_failed",
+            "message": "연결하지 못했어요. 아래 명령을 터미널에 붙여 넣어 주세요.", "detail": e.to_string(), "command": command,
+        }),
+    }
+}
+
+pub async fn api_connect_claude(State(st): State<Arc<LocalBridgeState>>) -> Json<Value> {
+    Json(connect_claude(&st.agent_id, st.app.port))
 }
 
 fn exit_soon() {

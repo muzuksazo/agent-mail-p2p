@@ -10,6 +10,7 @@
 //!      `agent-mail-p2p mcp --agent be --daemon-url http://127.0.0.1:18766`
 
 mod app_mode;
+mod hooks;
 mod layer1_transport;
 mod layer2_reconcile;
 mod layer3_state_auth;
@@ -35,7 +36,7 @@ use crate::layer2_reconcile::{GossipKind, ReconcileRequest, ReconcileResponse, S
 use crate::layer3_state_auth::{now_unix_ms, CapabilityCert, HybridClock, RoleScope};
 use crate::layer4_sqlite_view::SqliteProjection;
 use crate::layer5_mcp_bridge::{
-    build_local_http_router, reqwest_free_http_get, run_stdio_mcp_bridge, LocalBridgeState,
+    build_local_http_router, run_stdio_mcp_bridge, LocalBridgeState,
 };
 
 #[derive(Parser)]
@@ -84,13 +85,24 @@ enum Command {
     },
     /// 앱 모드(시작 화면 → 방 만들기/초대 코드 → 단톡방). 인자 없이 실행한 것과 같다.
     App,
+    /// Claude Code에 MCP 등록 + 받기용 훅(PostToolUse·UserPromptSubmit·Stop asyncRewake) 설치
+    ConnectClaude {
+        #[arg(long)]
+        agent: String,
+        #[arg(long, default_value_t = 18765)]
+        port: u16,
+    },
     /// PostToolUse / PreToolUse 라이프사이클 훅 실행
     Hook {
+        /// post-tool | prompt | stop-wait
         mode: String,
         #[arg(long)]
         agent: String,
         #[arg(long, default_value = "http://127.0.0.1:18765")]
         daemon_url: String,
+        /// stop-wait: 메일을 기다리는 최대 초
+        #[arg(long, default_value_t = 3500)]
+        max_secs: u64,
     },
 }
 
@@ -111,6 +123,10 @@ async fn main() -> Result<()> {
 
     match cmd {
         Command::App => app_mode::run().await,
+        Command::ConnectClaude { agent, port } => {
+            println!("{}", serde_json::to_string_pretty(&app_mode::connect_claude(&agent, port))?);
+            Ok(())
+        }
 
         Command::Mcp {
             agent,
@@ -122,35 +138,8 @@ async fn main() -> Result<()> {
             mode,
             agent,
             daemon_url,
-        } => {
-            if mode == "post-tool" {
-                let res = reqwest_free_http_get(&format!(
-                    "{daemon_url}/api/wait?agent={agent}&timeout=0"
-                ))?;
-                if let Some(hints) = res.get("hints").and_then(|v| v.as_array()) {
-                    if !hints.is_empty() {
-                        let summary: Vec<String> = hints
-                            .iter()
-                            .map(|h| {
-                                format!(
-                                    "@{}: {}",
-                                    h.get("sender").and_then(|v| v.as_str()).unwrap_or("peer"),
-                                    h.get("hint").and_then(|v| v.as_str()).unwrap_or("")
-                                )
-                            })
-                            .collect();
-                        let out = serde_json::json!({
-                            "hookSpecificOutput": {
-                                "hookEventName": "PostToolUse",
-                                "additionalContext": format!("[P2P 단톡 새 메일] {} -> fetch_inbox로 확인하세요.", summary.join(" | "))
-                            }
-                        });
-                        println!("{out}");
-                    }
-                }
-            }
-            Ok(())
-        }
+            max_secs,
+        } => hooks::run(&mode, &agent, &daemon_url, max_secs),
 
         Command::Open {
             agent,

@@ -361,7 +361,7 @@ impl SqliteProjection {
             "SELECT id, sender, recipient, priority, hint, hlc_wall_ms
              FROM messages
              WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1
-               AND priority = 'urgent' AND pushed_channel = 0 AND status IN ('sent', 'picked')
+               AND (priority = 'urgent' OR recipient = ?1) AND pushed_channel = 0 AND status IN ('sent', 'picked')
              ORDER BY hlc_wall_ms ASC"
         } else {
             "SELECT id, sender, recipient, priority, hint, hlc_wall_ms
@@ -395,7 +395,8 @@ impl SqliteProjection {
         for item in &rows {
             if urgent_only {
                 let _ = guard.conn.execute(
-                    "UPDATE messages SET pushed_channel = 1, status = CASE WHEN status = 'sent' THEN 'picked' ELSE status END WHERE id = ?1",
+                    // 채널 푸시는 자기 표시만 바꾼다. 채널이 꺼져 있으면 푸시는 버려지므로 훅 알림('sent'→'picked')을 막으면 안 된다.
+                    "UPDATE messages SET pushed_channel = 1 WHERE id = ?1",
                     params![item.id],
                 );
             } else {
@@ -408,29 +409,41 @@ impl SqliteProjection {
         rows
     }
 
-    pub fn fetch_inbox_bodies(&self, agent_id: &str) -> Vec<serde_json::Value> {
+    /// 아직 읽지 않은(보냄·알림 감) 나에게 온 메일 수. 훅 알림이나 채널 푸시만 간 메일도 포함한다.
+    pub fn unread_count(&self, agent_id: &str) -> i64 {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// 안 읽은 메일 본문을 시간순으로 돌려주고 '읽음'으로 표시한다(fetch_inbox / wait_mail 도구).
+    pub fn read_inbox(&self, agent_id: &str) -> Vec<serde_json::Value> {
         let guard = self.inner.lock().unwrap();
         let mut stmt = match guard.conn.prepare(
-            "SELECT id, sender, recipient, priority, hint, body_md, status, hlc_wall_ms
+            "SELECT id, sender, recipient, priority, body_md, hlc_wall_ms
              FROM messages
              WHERE (recipient = ?1 OR recipient = 'ALL') AND sender != ?1 AND status IN ('sent', 'picked')
-             ORDER BY hlc_wall_ms ASC",
+             ORDER BY hlc_wall_ms ASC, hlc_logical ASC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-
         let items: Vec<serde_json::Value> = stmt
             .query_map(params![agent_id], |r| {
                 Ok(serde_json::json!({
                     "id": r.get::<_, String>(0)?,
-                    "sender": r.get::<_, String>(1)?,
-                    "recipient": r.get::<_, String>(2)?,
+                    "from": r.get::<_, String>(1)?,
+                    "to": r.get::<_, String>(2)?,
                     "priority": r.get::<_, String>(3)?,
-                    "hint": r.get::<_, String>(4)?,
-                    "body_md": r.get::<_, String>(5)?,
-                    "status": r.get::<_, String>(6)?,
-                    "created_ms": r.get::<_, i64>(7)?,
+                    "body": r.get::<_, String>(4)?,
+                    "sent_at_ms": r.get::<_, i64>(5)?,
                 }))
             })
             .ok()
@@ -438,11 +451,11 @@ impl SqliteProjection {
             .flatten()
             .filter_map(|x| x.ok())
             .collect();
-
+        drop(stmt);
         for it in &items {
             if let Some(id) = it.get("id").and_then(|v| v.as_str()) {
                 let _ = guard.conn.execute(
-                    "UPDATE messages SET status = 'picked' WHERE id = ?1 AND status = 'sent'",
+                    "UPDATE messages SET status = 'read', pushed_channel = 1 WHERE id = ?1",
                     params![id],
                 );
             }
@@ -718,5 +731,78 @@ mod lease_persistence_tests {
         let mut guard = store.inner.lock().unwrap();
         let holders: Vec<String> = guard.arbiter.snapshot(now_unix_ms()).into_iter().map(|c| c.holder_agent).collect();
         assert_eq!(holders, vec!["be".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+    use crate::layer2_reconcile::{MailHeader, MailPriority};
+    use crate::layer3_state_auth::HlcTimestamp;
+
+    fn store(name: &str) -> SqliteProjection {
+        let dir = std::env::temp_dir().join(format!("amp2p-inbox-{}-{}-{}", name, std::process::id(), now_unix_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        SqliteProjection::open(&dir.join("m.sqlite3"), 1).unwrap()
+    }
+
+    fn put(s: &SqliteProjection, id: &str, from: &str, to: &str, urgent: bool, body: &str) {
+        let hdr = MailHeader {
+            id: id.into(),
+            sender_agent: from.into(),
+            recipient: to.into(),
+            priority: if urgent { MailPriority::Urgent } else { MailPriority::Normal },
+            hint: body.into(),
+            body_blake3: *blake3::hash(body.as_bytes()).as_bytes(),
+            body_len: body.len() as u32,
+            inline_body: Some(body.into()),
+            hlc: HlcTimestamp { wall_ms: now_unix_ms(), logical: 0, node_tag: [0; 8] },
+        };
+        s.commit_verified_mail(&hdr, body).unwrap();
+    }
+
+    fn ids(v: &[serde_json::Value]) -> Vec<String> {
+        v.iter().map(|m| m["id"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn inbox_returns_mine_and_all_then_marks_read() {
+        let s = store("read");
+        put(&s, "a", "pm", "be", false, "to be");
+        put(&s, "b", "pm", "ALL", false, "to all");
+        put(&s, "c", "pm", "qa", false, "to qa");
+        put(&s, "d", "be", "ALL", false, "from me");
+        assert_eq!(ids(&s.read_inbox("be")), vec!["a", "b"]);
+        assert!(s.read_inbox("be").is_empty(), "읽은 메일은 다시 나오지 않아야 한다");
+        assert_eq!(s.unread_count("be"), 0);
+    }
+
+    #[test]
+    fn hinted_mail_is_still_unread_until_fetched() {
+        let s = store("hinted");
+        put(&s, "a", "pm", "be", false, "hello");
+        assert_eq!(s.drain_pending_hints("be", false).len(), 1, "훅 알림이 한 번 나간다");
+        assert!(s.drain_pending_hints("be", false).is_empty(), "같은 알림은 반복되지 않는다");
+        assert_eq!(s.unread_count("be"), 1, "알림만 간 메일은 아직 안 읽음");
+        assert_eq!(ids(&s.read_inbox("be")), vec!["a"]);
+    }
+
+    #[test]
+    fn channel_push_does_not_steal_hook_notice() {
+        // 채널이 정책으로 꺼져 있으면 푸시는 버려진다. 그래도 훅 알림은 따로 한 번 가야 한다.
+        let s = store("both");
+        put(&s, "a", "pm", "be", false, "direct");
+        assert_eq!(s.drain_pending_hints("be", true).len(), 1, "채널 푸시");
+        assert_eq!(s.drain_pending_hints("be", false).len(), 1, "훅 알림도 받아야 한다");
+    }
+
+    #[test]
+    fn push_covers_urgent_and_direct_but_not_broadcast_chatter() {
+        let s = store("push");
+        put(&s, "u", "pm", "ALL", true, "urgent to all");
+        put(&s, "d", "pm", "be", false, "direct normal");
+        put(&s, "n", "pm", "ALL", false, "chatter");
+        let pushed: Vec<String> = s.drain_pending_hints("be", true).into_iter().map(|e| e.id).collect();
+        assert_eq!(pushed, vec!["u", "d"]);
     }
 }

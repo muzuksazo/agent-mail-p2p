@@ -81,11 +81,36 @@ pub fn build_local_http_router(state: Arc<LocalBridgeState>) -> AxumRouter {
         .route("/api/events", get(api_sse_events))
         .route("/api/send", post(api_send))
         .route("/api/leases/reserve", post(api_lease_reserve))
+        .route("/api/inbox", get(api_inbox))
         .route("/api/app/info", get(crate::app_mode::api_app_info))
         .route("/api/app/claude", post(crate::app_mode::api_connect_claude))
         .route("/api/app/quit", post(crate::app_mode::api_quit))
         .route("/api/app/leave", post(crate::app_mode::api_leave))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+pub struct InboxParams {
+    pub agent: String,
+    /// 안 읽은 메일이 없을 때 최대 몇 초 기다릴지(0 = 바로 돌려줌)
+    #[serde(default)]
+    pub wait: u64,
+}
+
+/// 안 읽은 메일 본문을 돌려주고 읽음 처리한다. wait>0이면 메일이 올 때까지 최대 wait초 기다린다.
+async fn api_inbox(State(st): State<Arc<LocalBridgeState>>, Query(q): Query<InboxParams>) -> Json<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(q.wait.min(300));
+    loop {
+        let notified = st.store.wake_notify.notified();
+        if st.store.unread_count(&q.agent) > 0 || q.wait == 0 {
+            let mail = st.store.read_inbox(&q.agent);
+            return Json(json!({ "ok": true, "count": mail.len(), "mail": mail }));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline || tokio::time::timeout(deadline - now, notified).await.is_err() {
+            return Json(json!({ "ok": true, "count": 0, "mail": [], "timed_out": true }));
+        }
+    }
 }
 
 async fn serve_embedded_ui() -> Html<&'static str> {
@@ -252,7 +277,7 @@ pub fn run_stdio_mcp_bridge(daemon_url: &str, agent_id: &str, enable_channel_pus
                                     "jsonrpc": "2.0",
                                     "method": "notifications/claude/channel",
                                     "params": {
-                                        "content": format!("[P2P 긴급 @{sender}] {hint_txt} (fetch_inbox 호출, id={mid})"),
+                                        "content": format!("[단톡방 새 메일 @{sender}] {hint_txt} — fetch_inbox 도구로 본문을 읽으세요 (id={mid})"),
                                         "meta": {
                                             "msg_id": mid,
                                             "sender": sender,
@@ -310,7 +335,9 @@ pub fn run_stdio_mcp_bridge(daemon_url: &str, agent_id: &str, enable_channel_pus
                     "tools": [
                         { "name": "send_mail", "description": "P2P 스웜으로 메시지 발송", "inputSchema": { "type": "object", "properties": { "recipient": {"type":"string"}, "body_md": {"type":"string"}, "priority": {"type":"string"} }, "required": ["recipient","body_md"] } },
                         { "name": "reserve_files", "description": "HLC 결정론적 배타 파일 리스 요청", "inputSchema": { "type": "object", "properties": { "glob_pattern": {"type":"string"} }, "required": ["glob_pattern"] } },
-                        { "name": "team_board_status", "description": "5인 P2P 작업 분담 및 리스 상태 조회", "inputSchema": { "type": "object", "properties": {} } }
+                        { "name": "team_board_status", "description": "5인 P2P 작업 분담 및 리스 상태 조회", "inputSchema": { "type": "object", "properties": {} } },
+                        { "name": "fetch_inbox", "description": "나에게 온 안 읽은 단톡방 메일을 본문까지 읽고 읽음 처리한다. '새 메일' 알림을 받으면 이것을 호출해 내용을 확인한다.", "inputSchema": { "type": "object", "properties": {} } },
+                        { "name": "wait_mail", "description": "안 읽은 메일이 올 때까지 최대 timeout_secs초(기본 60, 최대 300) 기다렸다가 본문을 돌려주고 읽음 처리한다. 팀원의 답을 기다려야 할 때 쓴다.", "inputSchema": { "type": "object", "properties": { "timeout_secs": {"type":"integer"} } } }
                     ]
                 }
             });
@@ -341,6 +368,11 @@ pub fn run_stdio_mcp_bridge(daemon_url: &str, agent_id: &str, enable_channel_pus
                     }),
                 )
                 .unwrap_or_default(),
+                "fetch_inbox" => reqwest_free_http_get(&format!("{daemon_url}/api/inbox?agent={agent_id}&wait=0")).unwrap_or_default(),
+                "wait_mail" => {
+                    let secs = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60).min(300);
+                    reqwest_free_http_get(&format!("{daemon_url}/api/inbox?agent={agent_id}&wait={secs}")).unwrap_or_default()
+                }
                 _ => json!({"ok": false, "error": "unknown tool"}),
             };
             let resp = json!({

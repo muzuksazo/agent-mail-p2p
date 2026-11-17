@@ -91,6 +91,7 @@
       <form id="sendForm">
         <select id="to" aria-label="받는 사람"><option value="ALL">모두에게</option></select>
         <input id="msg" type="text" placeholder="메시지를 입력하세요" autocomplete="off" />
+        <button type="button" id="btnUrgent" aria-pressed="false" title="켜면 받는 사람의 AI가 하던 일을 멈추고 바로 확인해요">🚨 급해요</button>
         <button class="primary" type="submit">보내기</button>
       </form>
     </section>
@@ -277,13 +278,23 @@
       setTimeout(wait, 800);
     });
 
+    let urgent = false;
+    function setUrgent(on) {
+      urgent = on;
+      $('btnUrgent').setAttribute('aria-pressed', String(on));
+      $('btnUrgent').style.background = on ? 'var(--danger)' : '';
+      $('btnUrgent').style.color = on ? '#fff' : '';
+    }
+    $('btnUrgent').addEventListener('click', () => setUrgent(!urgent));
+
     $('sendForm').addEventListener('submit', async e => {
       e.preventDefault();
       const txt = $('msg').value.trim(); if (!txt) return;
       $('msg').value = '';
       try {
         const r = await (await fetch('/api/send', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ recipient: $('to').value, body_md: txt, priority: 'normal' }) })).json();
+          body: JSON.stringify({ recipient: $('to').value, body_md: txt, priority: urgent ? 'urgent' : 'normal' }) })).json();
+        if (r.ok && urgent) setUrgent(false);
         if (!r.ok) { $('msg').value = txt; alert(r.error || '보내지 못했어요. 다시 눌러 주세요.'); }
       } catch (err) { $('msg').value = txt; alert('앱과 연결이 끊겼어요. 앱이 켜져 있는지 확인해 주세요.'); }
     });
