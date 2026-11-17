@@ -59,6 +59,10 @@ enum Command {
         port: u16,
         #[arg(long, default_value = ".agent_mail_p2p")]
         data_dir: PathBuf,
+        /// 예전에 발급한 입장 티켓: 그 방을 그대로 다시 연다(팀원 재초대 불필요).
+        /// 없으면 data_dir의 room.topic을 다시 쓰고, 그것도 없으면 새 방을 만든다.
+        #[arg(long)]
+        reopen: Option<String>,
     },
     /// 기존 P2P 스웜에 티켓 하나로 홀펀칭 합류 + 오프라인 누락 메시지 자동 복구
     Join {
@@ -146,8 +150,20 @@ async fn main() -> Result<()> {
             name,
             port,
             data_dir,
+            reopen,
         } => {
-            let topic: [u8; 32] = rand::random();
+            // 방(토픽)을 저장해 두고 다시 쓴다. 예전에는 켤 때마다 새 방이 생겨 팀원 연결이 끊겼다.
+            let topic_file = data_dir.join("room.topic");
+            let topic: [u8; 32] = if let Some(t) = reopen {
+                *SwarmTicket::from_str(&t)?.topic.as_bytes()
+            } else if let Ok(hex) = std::fs::read_to_string(&topic_file) {
+                let raw = data_encoding::HEXLOWER.decode(hex.trim().as_bytes())?;
+                raw.try_into().map_err(|_| anyhow::anyhow!("room.topic is not 32 bytes"))?
+            } else {
+                rand::random()
+            };
+            std::fs::create_dir_all(&data_dir)?;
+            std::fs::write(&topic_file, data_encoding::HEXLOWER.encode(&topic))?;
             start_host(agent, name, topic, port, data_dir, app_mode::AppInfo::default()).await
         }
 
