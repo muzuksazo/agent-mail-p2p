@@ -78,15 +78,23 @@ pub fn load_or_create_secret_key(key_file: &Path) -> Result<SecretKey> {
     if let Some(parent) = key_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let key = SecretKey::generate(&mut rand::rngs::OsRng);
+    // iroh 1.x: generate()는 내부 OS 난수원을 쓰며 인자를 받지 않는다.
+    let key = SecretKey::generate();
     std::fs::write(key_file, key.to_bytes())?;
     Ok(key)
 }
 
 /// QUIC 직결 스트림을 통해 범위 지문 비교(Range Set Reconciliation)와 BLAKE3 본문 청크를 응답하는 핸들러
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SyncBlobProtocol {
     pub store: Arc<SqliteProjection>,
+}
+
+// iroh 1.x의 ProtocolHandler는 Debug를 요구한다. SQLite 연결 내부는 출력하지 않는다.
+impl fmt::Debug for SyncBlobProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyncBlobProtocol").finish_non_exhaustive()
+    }
 }
 
 impl ProtocolHandler for SyncBlobProtocol {
