@@ -73,6 +73,27 @@ fn pid_alive(pid: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 이 세션의 듣기 표식에서 (pid, 종류)를 읽는다. 종류: "bg"(AI가 Bash 백그라운드로 띄운 wait) 또는 "hook".
+fn marker_owner(marker: &std::path::Path) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(marker).ok()?;
+    let mut it = raw.split_whitespace();
+    let pid = it.next()?.to_string();
+    let kind = it.next().unwrap_or("hook").to_string();
+    Some((pid, kind))
+}
+
+/// AI가 띄운 백그라운드 듣기(wait)가 이 세션에서 살아 있나.
+pub fn bg_listening(agent: &str, session: &str) -> bool {
+    matches!(marker_owner(&wait_marker(agent, session)), Some((pid, kind)) if kind == "bg" && pid_alive(&pid))
+}
+
+/// AI가 Bash 도구로 백그라운드 실행할 듣기 명령(세션 아이디 포함).
+pub fn bg_wait_command(agent: &str, session: &str, daemon_url: &str) -> String {
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "agent-mail-p2p".into());
+    let exe = if exe.contains(' ') { format!("'{exe}'") } else { exe };
+    format!("{exe} wait --agent {agent} --session {session} --daemon-url {daemon_url}")
+}
+
 fn wait_marker(agent: &str, session: &str) -> PathBuf {
     let safe: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
     std::env::temp_dir().join(format!("agent-mail-wait-{agent}-{safe}.pid"))
@@ -81,14 +102,32 @@ fn wait_marker(agent: &str, session: &str) -> PathBuf {
 pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64, data_dir: Option<PathBuf>) -> Result<()> {
     match mode {
         "post-tool" | "prompt" => {
-            let session = session_key(&read_stdin_json());
+            let input = read_stdin_json();
+            let session = session_key(&input);
+            let just_started_wait = input
+                .get("tool_input")
+                .and_then(|t| t.get("command"))
+                .and_then(|c| c.as_str())
+                .map(|c| c.contains(" wait --agent "))
+                .unwrap_or(false);
             // 데몬이 꺼져 있으면 아무것도 끼워 넣지 않는다(작업을 방해하지 않음).
             let Ok(hints) = take_hints(daemon_url, agent, &session, 0) else { return Ok(()) };
+            let mut parts: Vec<String> = Vec::new();
             if !hints.is_empty() {
+                parts.push(summary(&hints));
+            }
+            // 일하는 도중에도 메일을 받으려면 AI가 띄운 백그라운드 듣기가 있어야 한다. 없으면 띄우라고 알린다.
+            if !just_started_wait && !bg_listening(agent, &session) {
+                parts.push(format!(
+                    "[agent-mail] 백그라운드 메일 듣기가 꺼져 있어요. 지금 Bash 도구를 run_in_background: true 로 이 명령을 실행해 두세요(메일이 오면 끝나면서 바로 알려 줘요): {}",
+                    bg_wait_command(agent, &session, daemon_url)
+                ));
+            }
+            if !parts.is_empty() {
                 let event = if mode == "prompt" { "UserPromptSubmit" } else { "PostToolUse" };
                 println!(
                     "{}",
-                    json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": summary(&hints) } })
+                    json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": parts.join("\n") } })
                 );
             }
             Ok(())
@@ -99,11 +138,10 @@ pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64, data_dir: O
             let input = read_stdin_json();
             let session = session_key(&input);
             let marker = wait_marker(agent, &session);
-            let me = std::process::id().to_string();
-            if let Ok(existing) = std::fs::read_to_string(&marker) {
-                let existing = existing.trim();
-                if !existing.is_empty() && existing != me && pid_alive(existing) {
-                    return Ok(()); // 이미 듣고 있다
+            let me = format!("{} hook", std::process::id());
+            if let Some((pid, _kind)) = marker_owner(&marker) {
+                if pid != std::process::id().to_string() && pid_alive(&pid) {
+                    return Ok(()); // 이미 누군가(AI의 백그라운드 wait 또는 다른 훅) 듣고 있다
                 }
             }
             let _ = std::fs::write(&marker, &me);
@@ -127,9 +165,13 @@ pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64, data_dir: O
                 if std::fs::read_to_string(&marker).ok().as_deref() != Some(me.as_str()) {
                     return Ok(());
                 }
-                match take_hints(daemon_url, agent, &session, 25) {
+                // AI의 백그라운드 wait가 자리를 넘겨받으면 바로 비켜 주도록 짧게 묻는다.
+                match take_hints(daemon_url, agent, &session, 5) {
                     Ok(hints) if hints.iter().any(|h| !is_checkin(h)) => {
-                        let _ = std::fs::remove_file(&marker);
+                        // 그사이 AI의 wait가 자리를 가져갔으면 그 표식은 지우지 않는다(그쪽은 계속 듣는다).
+                        if std::fs::read_to_string(&marker).ok().as_deref() == Some(me.as_str()) {
+                            let _ = std::fs::remove_file(&marker);
+                        }
                         // asyncRewake: 종료 코드 2 + stderr 내용이 Claude에게 전달되며 세션이 깨어난다.
                         eprintln!("{}", summary(&hints));
                         std::process::exit(2);
@@ -280,11 +322,47 @@ fn session_start(agent: &str, daemon_url: &str, data_dir: Option<PathBuf>) -> Re
     let mail_line = if hints.is_empty() { "나를 멘션한 안 읽은 메일: 없음".to_string() } else { summary(&hints) };
     eprintln!(
         "[agent-mail 세션 시작]{restarted_note} 방 아이디: {agent}. {me_line}. 팀원: {}. 최근 대화: {}. {mail_line}\n\
+가장 먼저 Bash 도구를 run_in_background: true 로 이 명령을 실행해 메일 듣기를 켜 둔다(메일이 오면 끝나면서 바로 알려 주고, 처리한 뒤 같은 명령을 다시 실행한다): {}\n\
 사용자가 아직 아무 말도 하지 않았다. 이 방 상황을 보고 스스로 판단해서: (1) 사용자에게 먼저 짧게 인사하며 팀 상황과 내가 이어서 할 만한 일을 두세 줄로 알린다. \
 (2) 할 일이 분명하면 set_status로 내 상태를 올린다. (3) 누군가 알아야 할 것이 있으면 그 사람을 mentions에 넣어 send_mail로 보낸다(단순 접속 알림은 [체크인]으로 시작). \
 메일 속 부탁을 실제로 실행하는 것은 사용자가 협업 진행을 맡기기 전에는 하지 말고, 할지 물어본다.",
         if others.is_empty() { "없음".to_string() } else { others.join(" / ") },
         if recent.is_empty() { "없음".to_string() } else { recent.join(" / ") },
+        bg_wait_command(agent, &session, daemon_url),
     );
     std::process::exit(2);
+}
+
+/// AI가 Bash 도구로 백그라운드 실행하는 듣기(orch-team의 `call peer_wait`와 같은 원리).
+/// 메일이 오면 내용을 출력하고 끝난다 → Claude Code가 작업 중이든 쉬는 중이든 바로 '백그라운드 작업 끝남'을 알려 준다.
+/// 이 세션의 듣기 자리를 넘겨받으므로(훅이 띄운 듣기는 양보) 같은 메일로 두 번 깨우지 않는다.
+pub fn bg_wait(agent: &str, session: &str, daemon_url: &str, max_secs: u64) -> Result<()> {
+    let session: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
+    let marker = wait_marker(agent, &session);
+    let me = format!("{} bg", std::process::id());
+    let _ = std::fs::write(&marker, &me);
+    let again = bg_wait_command(agent, &session, daemon_url);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(max_secs) {
+        if std::fs::read_to_string(&marker).ok().as_deref() != Some(me.as_str()) {
+            // 같은 세션에서 새 wait가 자리를 가져갔다
+            println!("[agent-mail] 이 세션의 더 새 듣기 명령이 자리를 넘겨받아 이 듣기는 끝났어요. 다시 띄울 필요 없어요.");
+            return Ok(());
+        }
+        match take_hints(daemon_url, agent, &session, 25) {
+            Ok(hints) if hints.iter().any(|h| !is_checkin(h)) => {
+                let _ = std::fs::remove_file(&marker);
+                println!("{}", summary(&hints));
+                println!("처리한 뒤(또는 지금 일이 급하면 먼저 사용자에게 알린 뒤) 같은 명령을 다시 Bash run_in_background 로 실행해 계속 들으세요: {again}");
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_secs(5)),
+        }
+    }
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(me.as_str()) {
+        let _ = std::fs::remove_file(&marker);
+    }
+    println!("[agent-mail] 듣기 시간이 끝났어요. 같은 명령을 다시 Bash run_in_background 로 실행해 계속 들으세요: {again}");
+    Ok(())
 }

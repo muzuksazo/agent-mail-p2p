@@ -89,6 +89,18 @@ enum Command {
     },
     /// 앱 모드(시작 화면 → 방 만들기/초대 코드 → 단톡방). 인자 없이 실행한 것과 같다.
     App,
+    /// 메일이 올 때까지 기다렸다가 내용을 출력하고 끝난다. AI가 Bash 도구로 백그라운드 실행해 두면
+    /// 일하는 도중에도 메일이 오는 즉시 알림을 받는다(orch-team `call peer_wait`와 같은 방식).
+    Wait {
+        #[arg(long)]
+        agent: String,
+        #[arg(long, default_value = "default")]
+        session: String,
+        #[arg(long, default_value = "http://127.0.0.1:18765")]
+        daemon_url: String,
+        #[arg(long, default_value_t = 28800)]
+        max_secs: u64,
+    },
     /// Claude Code에 MCP 등록 + 받기용 훅(PostToolUse·UserPromptSubmit·Stop asyncRewake) 설치
     ConnectClaude {
         #[arg(long)]
@@ -130,6 +142,7 @@ async fn main() -> Result<()> {
 
     match cmd {
         Command::App => app_mode::run().await,
+        Command::Wait { agent, session, daemon_url, max_secs } => hooks::bg_wait(&agent, &session, &daemon_url, max_secs),
         Command::ConnectClaude { agent, port } => {
             println!("{}", serde_json::to_string_pretty(&app_mode::connect_claude(&agent, port))?);
             Ok(())
