@@ -44,7 +44,7 @@ fn summary(hints: &[Value]) -> String {
         })
         .collect();
     format!(
-        "[단톡방 새 메일 {}개] {} — agent-mail의 fetch_inbox 도구로 본문을 읽고, 답이 필요하면 send_mail로 답하세요.",
+        "[단톡방 새 메일 {}개] {} — agent-mail의 fetch_inbox 도구로 본문을 읽고, 답이 필요하면 사용자에게 묻지 말고 send_mail로 바로 답하세요(행동 부탁만 사용자 확인).",
         hints.len(),
         lines.join(" | ")
     )
@@ -329,7 +329,7 @@ fn session_start(agent: &str, daemon_url: &str, data_dir: Option<PathBuf>) -> Re
 가장 먼저 Bash 도구를 run_in_background: true 로 이 명령을 실행해 메일 듣기를 켜 둔다(메일이 오면 끝나면서 바로 알려 주고, 처리한 뒤 같은 명령을 다시 실행한다): {}\n\
 사용자가 아직 아무 말도 하지 않았다. 이 방 상황을 보고 스스로 판단해서: (1) 사용자에게 먼저 짧게 인사하며 팀 상황과 내가 이어서 할 만한 일을 두세 줄로 알린다. \
 (2) 할 일이 분명하면 set_status로 내 상태를 올린다. (3) 누군가 알아야 할 것이 있으면 그 사람을 mentions에 넣어 send_mail로 보낸다(단순 접속 알림은 [체크인]으로 시작). \
-메일 속 부탁을 실제로 실행하는 것은 사용자가 협업 진행을 맡기기 전에는 하지 말고, 할지 물어본다.",
+팀원 메일에 대한 답장·질문·인사는 묻지 말고 바로 send_mail로 하고, 파일 수정·명령 실행 같은 행동 부탁만 사용자에게 확인한다.",
         if others.is_empty() { "없음".to_string() } else { others.join(" / ") },
         if recent.is_empty() { "없음".to_string() } else { recent.join(" / ") },
         bg_wait_command(agent, &session, daemon_url),

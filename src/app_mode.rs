@@ -421,6 +421,25 @@ pub fn install_claude_hooks(agent: &str, port: u16) -> Result<String> {
         let arr = groups.as_array_mut().context("hook 목록이 배열이 아니에요")?;
         arr.push(json!({ "hooks": [handler] }));
     }
+    // 3) 사용자가 연결을 허락했으니 agent-mail 도구와 듣기 명령은 Claude 자동 승인이 다시 막지 않게 허용 목록에 넣는다.
+    //    (이 두 가지만. 다른 권한은 건드리지 않는다.) 사람 입력 없이 깨어난 AI가 답장하지 못하던 문제를 푼다.
+    let exe_raw = current_exe_string();
+    let wanted_allow = vec![
+        "mcp__agent-mail".to_string(),
+        format!("Bash({exe_raw} wait:*)"),
+    ];
+    let perms = root.as_object_mut().context("settings.json 최상위가 객체가 아니에요")?
+        .entry("permissions").or_insert_with(|| json!({}));
+    let allow = perms.as_object_mut().context("permissions가 객체가 아니에요")?
+        .entry("allow").or_insert_with(|| json!([]));
+    let arr = allow.as_array_mut().context("permissions.allow가 배열이 아니에요")?;
+    arr.retain(|v| {
+        let s = v.as_str().unwrap_or("");
+        !(s == "mcp__agent-mail" || s.starts_with("mcp__agent-mail__") || (s.starts_with("Bash(") && s.contains("agent-mail-p2p wait")))
+    });
+    for a in wanted_allow {
+        arr.push(json!(a));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
