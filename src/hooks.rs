@@ -7,7 +7,7 @@
 //!
 //! - `session-start` (SessionStart, asyncRewake): 세션을 열면 방 데몬이 꺼져 있을 때 저장된 방 설정으로
 //!   다시 켜고, 알릴 새 메일이 있거나 켜지 못했으면 종료 코드 2로 끝나 Claude가 먼저 말을 걸게 한다.
-//!   알릴 것이 없으면 조용히 끝난다(사용량을 쓰지 않음).
+//!   새로 연 세션에서 안 읽은 메일이 있으면 먼저 말하고, 없거나 이어 열기·압축이면 조용히 끝난다.
 //!
 //! 알림은 세션마다 한 번만 간다. 본문은 MCP `fetch_inbox`로 읽어야 '읽음'이 된다.
 
@@ -187,9 +187,9 @@ fn start_room(agent: &str, daemon_url: &str, data_dir: Option<PathBuf>) -> std::
 
 fn session_start(agent: &str, daemon_url: &str, data_dir: Option<PathBuf>) -> Result<()> {
     let input = read_stdin_json();
-    // 대화 압축·초기화 때는 다시 인사하지 않는다.
+    // 새로 연 세션(startup)일 때만 인사한다. 이어 열기·압축·초기화 때는 다시 말하지 않는다.
     let source = input.get("source").and_then(|v| v.as_str()).unwrap_or("startup");
-    if source == "compact" || source == "clear" {
+    if source != "startup" {
         return Ok(());
     }
     let session = session_key(&input);
@@ -216,11 +216,8 @@ fn session_start(agent: &str, daemon_url: &str, data_dir: Option<PathBuf>) -> Re
         }
     }
 
-    // 아직 어느 세션에도 알리지 않은 메일만: 세션을 열 때마다 같은 메일로 인사하지 않는다.
-    let hints = reqwest_free_http_get(&format!("{daemon_url}/api/wait?agent={agent}&session={session}&fresh=1&timeout=0"))
-        .ok()
-        .and_then(|r| r.get("hints").and_then(|v| v.as_array()).cloned())
-        .unwrap_or_default();
+    // 새 세션이면 안 읽은 메일을 알린다. 메일은 fetch_inbox로 읽어야 '읽음'이 되므로, 읽고 나면 다음 세션부터는 조용하다.
+    let hints = take_hints(daemon_url, agent, &session, 0).unwrap_or_default();
     if hints.is_empty() {
         return Ok(()); // 알릴 것이 없으면 조용히(사용량을 쓰지 않음)
     }
