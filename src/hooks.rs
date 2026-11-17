@@ -77,8 +77,15 @@ pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64) -> Result<(
             let marker = wait_marker(agent, &session);
             let me = std::process::id().to_string();
             let _ = std::fs::write(&marker, &me);
+            // 이 대기를 띄운 Claude 세션이 닫히면 부모가 바뀐다(고아). 그때는 기다릴 이유가 없다.
+            #[cfg(unix)]
+            let parent_at_start = std::os::unix::process::parent_id();
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(max_secs) {
+                #[cfg(unix)]
+                if std::os::unix::process::parent_id() != parent_at_start {
+                    return Ok(());
+                }
                 // 같은 세션에서 더 새 대기가 시작됐으면 이 대기는 할 일이 없다.
                 if std::fs::read_to_string(&marker).ok().as_deref() != Some(me.as_str()) {
                     return Ok(());
