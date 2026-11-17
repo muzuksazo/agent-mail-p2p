@@ -386,12 +386,14 @@ pub fn install_claude_hooks(agent: &str, port: u16) -> Result<String> {
     let url = format!("http://127.0.0.1:{port}");
     let cmd = |mode: &str| format!("{exe} hook {mode} --agent {agent} --daemon-url {url}");
     let ours = |h: &Value| {
-        h.get("command").and_then(|c| c.as_str()).map(|c| c.contains(" hook post-tool ") || c.contains(" hook prompt ") || c.contains(" hook stop-wait ") || c.contains(" hook session-start ") || c.contains(" hook listen ")).unwrap_or(false)
+        h.get("command").and_then(|c| c.as_str()).map(|c| c.contains(" hook post-tool ") || c.contains(" hook prompt ") || c.contains(" hook stop-wait ") || c.contains(" hook session-start ") || c.contains(" hook listen ") || c.contains(" hook pre-tool ")).unwrap_or(false)
             && h.get("command").and_then(|c| c.as_str()).map(|c| c.contains("agent-mail")).unwrap_or(false)
     };
     let hooks = root.as_object_mut().context("settings.json 최상위가 객체가 아니에요")?
         .entry("hooks").or_insert_with(|| json!({}));
     let wanted = [
+        // 도구 실행 직전: 듣기 명령을 앞쪽에서 돌리는 실수를 막고, 안내를 계속 무시하면 듣기부터 켜게 한다.
+        ("PreToolUse", json!({ "type": "command", "command": cmd("pre-tool"), "timeout": 10 })),
         ("PostToolUse", json!({ "type": "command", "command": cmd("post-tool"), "timeout": 10 })),
         ("UserPromptSubmit", json!({ "type": "command", "command": cmd("prompt"), "timeout": 10 })),
         // 세션을 열면 꺼진 방을 다시 켜고, 방 상황을 들고 Claude가 먼저 말을 건다.

@@ -117,7 +117,10 @@ pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64, data_dir: O
                 parts.push(summary(&hints));
             }
             // 일하는 도중에도 메일을 받으려면 AI가 띄운 백그라운드 듣기가 있어야 한다. 없으면 띄우라고 알린다.
-            if !just_started_wait && !bg_listening(agent, &session) {
+            if bg_listening(agent, &session) {
+                reset_nags(agent, &session);
+            } else if !just_started_wait {
+                bump_nags(agent, &session);
                 parts.push(format!(
                     "[agent-mail] 백그라운드 메일 듣기가 꺼져 있어요. 지금 Bash 도구를 run_in_background: true 로 이 명령을 실행해 두세요(메일이 오면 끝나면서 바로 알려 줘요): {}",
                     bg_wait_command(agent, &session, daemon_url)
@@ -186,7 +189,8 @@ pub fn run(mode: &str, agent: &str, daemon_url: &str, max_secs: u64, data_dir: O
             Ok(())
         }
         "session-start" => session_start(agent, daemon_url, data_dir),
-        other => anyhow::bail!("unknown hook mode: {other} (post-tool | prompt | listen | session-start)"),
+        "pre-tool" => pre_tool(agent, daemon_url),
+        other => anyhow::bail!("unknown hook mode: {other} (post-tool | prompt | listen | session-start | pre-tool)"),
     }
 }
 
@@ -364,5 +368,61 @@ pub fn bg_wait(agent: &str, session: &str, daemon_url: &str, max_secs: u64) -> R
         let _ = std::fs::remove_file(&marker);
     }
     println!("[agent-mail] 듣기 시간이 끝났어요. 같은 명령을 다시 Bash run_in_background 로 실행해 계속 들으세요: {again}");
+    Ok(())
+}
+
+/// 이 세션이 '듣기 꺼짐' 안내를 몇 번 받았는지(무시한 횟수).
+fn nag_file(agent: &str, session: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("agent-mail-nag-{agent}-{session}.count"))
+}
+fn nag_count(agent: &str, session: &str) -> u32 {
+    std::fs::read_to_string(nag_file(agent, session)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+fn bump_nags(agent: &str, session: &str) {
+    let _ = std::fs::write(nag_file(agent, session), (nag_count(agent, session) + 1).to_string());
+}
+fn reset_nags(agent: &str, session: &str) {
+    let _ = std::fs::remove_file(nag_file(agent, session));
+}
+
+/// 안내를 이 횟수 이상 무시하면 막기 시작한다.
+const NAGS_BEFORE_BLOCK: u32 = 3;
+
+fn deny(reason: &str) {
+    println!(
+        "{}",
+        json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })
+    );
+}
+
+/// PreToolUse: 백그라운드 듣기를 조건부로 강제한다.
+/// - wait 명령을 앞쪽(포그라운드)에서 실행하려 하면 막는다(그러면 Claude 자신이 묶인다).
+/// - 방이 켜져 있고, 이 세션에 AI의 wait가 없고, 안내를 NAGS_BEFORE_BLOCK번 이상 무시했으면
+///   agent-mail 도구와 wait 실행 말고는 막는다. 방이 꺼져 있으면 절대 막지 않는다.
+fn pre_tool(agent: &str, daemon_url: &str) -> Result<()> {
+    let input = read_stdin_json();
+    let session = session_key(&input);
+    let tool = input.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
+    let command = tool_input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    let is_wait = tool == "Bash" && command.contains(" wait --agent ");
+    if is_wait {
+        let background = tool_input.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !background {
+            deny("agent-mail 듣기 명령은 메일이 올 때까지 끝나지 않아요. 같은 명령을 Bash 도구의 run_in_background: true 로 다시 실행하세요.");
+        }
+        return Ok(());
+    }
+    if tool.starts_with("mcp__agent-mail__") || bg_listening(agent, &session) {
+        return Ok(());
+    }
+    if nag_count(agent, &session) < NAGS_BEFORE_BLOCK || !daemon_alive(daemon_url) {
+        return Ok(());
+    }
+    deny(&format!(
+        "agent-mail 백그라운드 메일 듣기가 꺼진 채로 안내를 {}번 넘게 지나쳤어요. 다른 작업 전에 먼저 Bash 도구를 run_in_background: true 로 이 명령을 실행하세요: {}",
+        NAGS_BEFORE_BLOCK,
+        bg_wait_command(agent, &session, daemon_url)
+    ));
     Ok(())
 }
